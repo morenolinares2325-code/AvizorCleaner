@@ -1,0 +1,2 @@
+# AvizorCleaner
+cleaner full pc
