@@ -1,0 +1,9 @@
+{
+    "app_name": "AvizorCleaner",
+    "version": "1.0.0",
+    "theme": "dark",
+    "language": "es",
+    "auto_update": true,
+    "auto_health_scan": true,
+    "auto_check_ai": true
+}
