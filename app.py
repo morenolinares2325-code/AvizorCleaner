@@ -1,15 +1,15 @@
 import os
 import json
-import platform
-import psutil
 import socket
-import requests
+import platform
 import tempfile
+import requests
+import psutil
 
 from datetime import datetime
 
 # =========================================================
-# ARCHIVOS DE CONFIGURACIÓN
+# ARCHIVOS
 # =========================================================
 
 CONFIG_FILE = "config.json"
@@ -25,16 +25,27 @@ class ConfigurationManager:
     def load_config():
 
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+
+            with open(
+                CONFIG_FILE,
+                "r",
+                encoding="utf-8"
+            ) as f:
+
                 return json.load(f)
 
         except Exception:
+
             return {}
 
     @staticmethod
     def save_config(config):
 
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        with open(
+            CONFIG_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
 
             json.dump(
                 config,
@@ -114,8 +125,34 @@ class AIProviderManager:
         data["providers"] = [
             p
             for p in data["providers"]
-            if p["name"] != name
+            if p["name"].lower() != name.lower()
         ]
+
+        AIProviderManager.save_providers(data)
+
+    @staticmethod
+    def enable_provider(name):
+
+        data = AIProviderManager.load_providers()
+
+        for provider in data["providers"]:
+
+            if provider["name"].lower() == name.lower():
+
+                provider["enabled"] = True
+
+        AIProviderManager.save_providers(data)
+
+    @staticmethod
+    def disable_provider(name):
+
+        data = AIProviderManager.load_providers()
+
+        for provider in data["providers"]:
+
+            if provider["name"].lower() == name.lower():
+
+                provider["enabled"] = False
 
         AIProviderManager.save_providers(data)
 
@@ -125,7 +162,6 @@ class AIProviderManager:
         data = AIProviderManager.load_providers()
 
         return data["providers"]
-
 # =========================================================
 # INFORMACIÓN DEL SISTEMA
 # =========================================================
@@ -172,8 +208,9 @@ class SystemInfo:
             )
         }
 
+
 # =========================================================
-# HEALTH ANALYZER
+# HEALTH SCORE
 # =========================================================
 
 class HealthAnalyzer:
@@ -222,13 +259,11 @@ class HealthAnalyzer:
             status = "CRITICO"
 
         return {
-
             "score": score,
-
             "status": status,
-
             "recommendations": recommendations
         }
+
 
 # =========================================================
 # RED
@@ -256,6 +291,7 @@ class NetworkManager:
         for unit in units:
 
             if value < 1024:
+
                 return f"{value:.2f} {unit}"
 
             value /= 1024
@@ -299,8 +335,10 @@ class NetworkManager:
         except Exception:
 
             return "No disponible"
+
+
 # =========================================================
-# LIMPIEZA
+# CLEANER
 # =========================================================
 
 class Cleaner:
@@ -316,6 +354,7 @@ class Cleaner:
         temp_dir = Cleaner.get_temp_folder()
 
         total_size = 0
+
         total_files = 0
 
         for root, dirs, files in os.walk(temp_dir):
@@ -334,14 +373,90 @@ class Cleaner:
                     pass
 
         return {
-
             "files": total_files,
-
             "size_mb": round(
                 total_size / (1024 * 1024),
                 2
             )
         }
+# =========================================================
+# AI HUB MENU
+# =========================================================
+
+def ai_hub_menu():
+
+    while True:
+
+        print()
+        print("========== AI HUB ==========")
+        print("1. Ver proveedores")
+        print("2. Añadir proveedor")
+        print("3. Eliminar proveedor")
+        print("4. Activar proveedor")
+        print("5. Desactivar proveedor")
+        print("0. Volver")
+        print()
+
+        option = input("Opción: ")
+
+        if option == "1":
+
+            providers = AIProviderManager.get_all()
+
+            if not providers:
+
+                print("No hay proveedores")
+
+            else:
+
+                for provider in providers:
+
+                    print(
+                        f"{provider['name']} | "
+                        f"{provider['model']} | "
+                        f"{'ACTIVO' if provider['enabled'] else 'DESACTIVADO'}"
+                    )
+
+        elif option == "2":
+
+            name = input("Nombre: ")
+            key = input("API Key: ")
+
+            AIProviderManager.add_provider(
+                name=name,
+                api_key=key
+            )
+
+            print("Proveedor añadido.")
+
+        elif option == "3":
+
+            name = input("Proveedor a eliminar: ")
+
+            AIProviderManager.remove_provider(name)
+
+            print("Proveedor eliminado.")
+
+        elif option == "4":
+
+            name = input("Proveedor: ")
+
+            AIProviderManager.enable_provider(name)
+
+            print("Proveedor activado.")
+
+        elif option == "5":
+
+            name = input("Proveedor: ")
+
+            AIProviderManager.disable_provider(name)
+
+            print("Proveedor desactivado.")
+
+        elif option == "0":
+
+            break
+
 
 # =========================================================
 # MAIN
@@ -360,46 +475,14 @@ def main():
 
     print()
     print("Equipo:", info["hostname"])
-
     print("Sistema:", info["os"])
-
-    print(
-        "CPU:",
-        info["cpu_usage"],
-        "%"
-    )
-
-    print(
-        "RAM:",
-        info["ram_usage"],
-        "%"
-    )
-
-    print(
-        "Disco:",
-        info["disk_usage"],
-        "%"
-    )
+    print("CPU:", info["cpu_usage"], "%")
+    print("RAM:", info["ram_usage"], "%")
+    print("Disco:", info["disk_usage"], "%")
 
     print()
-    print(
-        "Health Score:",
-        result["score"]
-    )
-
-    print(
-        "Estado:",
-        result["status"]
-    )
-
-    if result["recommendations"]:
-
-        print()
-        print("Recomendaciones:")
-
-        for r in result["recommendations"]:
-
-            print("-", r)
+    print("Health Score:", result["score"])
+    print("Estado:", result["status"])
 
     print()
     print("========== RED ==========")
@@ -418,6 +501,16 @@ def main():
         NetworkManager.format_bytes(
             network["bytes_received"]
         )
+    )
+
+    print(
+        "IP Local:",
+        NetworkManager.get_local_ip()
+    )
+
+    print(
+        "IP Pública:",
+        NetworkManager.get_public_ip()
     )
 
     print()
@@ -443,31 +536,32 @@ def main():
 
     if not providers:
 
-        print(
-            "No hay proveedores configurados"
-        )
+        print("No hay proveedores configurados")
 
     else:
 
         for provider in providers:
 
-            status = (
-                "ACTIVO"
-                if provider.get("enabled", False)
-                else "DESACTIVADO"
-            )
-
             print(
                 f"{provider['name']} | "
-                f"Modelo: {provider['model']} | "
-                f"Estado: {status}"
+                f"{provider['model']}"
             )
 
     print()
+    print("¿Abrir AI HUB?")
+    print("1 = Sí")
+    print("0 = No")
+
+    option = input("> ")
+
+    if option == "1":
+
+        ai_hub_menu()
+
 
 # =========================================================
 # INICIO
 # =========================================================
 
 if __name__ == "__main__":
-    main() 
+    main()

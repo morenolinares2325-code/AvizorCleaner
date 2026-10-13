@@ -6,6 +6,13 @@
             "endpoint": "",
             "model": "auto",
             "enabled": true
+        },
+        {
+            "name": "openai",
+            "api_key": "test",
+            "endpoint": "",
+            "model": "auto",
+            "enabled": true
         }
     ]
 }
