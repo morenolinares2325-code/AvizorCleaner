@@ -1,3 +1,11 @@
 {
-    "providers": []
+    "providers": [
+        {
+            "name": "Gemini",
+            "api_key": "",
+            "endpoint": "",
+            "model": "auto",
+            "enabled": true
+        }
+    ]
 }
