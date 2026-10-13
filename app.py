@@ -50,7 +50,35 @@ class ConfigurationManager:
                 ensure_ascii=False
             )
 class AIProviderManager:
+    @staticmethod
+    def save_detected_model(
+        provider_name,
+        model
+    ):
 
+        data = (
+            AIProviderManager
+            .load_providers()
+        )
+
+        for provider in data[
+            "providers"
+        ]:
+
+            if (
+                provider["name"]
+                .lower()
+                ==
+                provider_name.lower()
+            ):
+
+                provider[
+                    "detected_model"
+                ] = model
+
+        AIProviderManager.save_providers(
+            data
+        )
     @staticmethod
     def load_providers():
 
@@ -161,7 +189,77 @@ class AIProviderManager:
 
 
 class AIValidator:
+    
+    @staticmethod
+    def auto_detect_model(provider):
 
+        print("DEBUG:", provider)
+
+        provider_name = (
+            provider["name"]
+            .lower()
+        )
+
+        print("DEBUG NAME:", provider_name)
+
+        if "gemini" in provider_name:
+
+            print("ENTRA EN GEMINI")
+
+            return "gemini-latest"
+
+        elif "openai" in provider_name:
+
+            return "gpt-4o-mini"
+
+        elif "deepseek" in provider_name:
+
+            return "deepseek-chat"
+
+        elif "groq" in provider_name:
+
+            return "llama-3.3-70b"
+
+        elif "openrouter" in provider_name:
+
+            return "auto"
+
+        return "desconocido"
+    @staticmethod
+    def get_gemini_models(api_key):
+
+        try:
+
+            url = (
+                "https://generativelanguage.googleapis.com"
+                "/v1beta/models"
+            )
+
+            response = requests.get(
+                url,
+                params={
+                    "key": api_key
+                },
+                timeout=10
+            )
+
+            if response.status_code != 200:
+
+                return []
+
+            data = response.json()
+
+            return [
+                model["name"]
+                for model in data.get(
+                    "models",
+                    []
+                )
+            ]
+
+        except Exception:
+
+            return []
     @staticmethod
     def check_provider(provider):
 
@@ -556,8 +654,6 @@ def ai_hub_menu():
 
     while True:
 
-        print()
-        print("AI HUB")
         print("1. Ver")
         print("2. Añadir")
         print("3. Eliminar")
@@ -565,6 +661,7 @@ def ai_hub_menu():
         print("5. Desactivar")
         print("6. Verificar")
         print("7. SpeedTest")
+        print("8. Auto detectar modelo")
         print("0. Salir")
 
         option = input("> ")
@@ -678,7 +775,49 @@ def ai_hub_menu():
                     "Error:",
                     result["error"]
                 )
+        elif option == "8":
 
+            name = input(
+                "Proveedor: "
+            )
+
+            providers = (
+                AIProviderManager
+                .get_all()
+            )
+
+            provider = next(
+                (
+                    p
+                    for p in providers
+                    if p["name"].lower()
+                    == name.lower()
+                ),
+                None
+            )
+
+            if provider:
+
+                model = (
+                    AIValidator
+                    .auto_detect_model(
+                        provider
+                    )
+                )
+
+                print()
+                print(
+                    "Modelo detectado:"
+                )
+
+                print(model)
+
+            else:
+
+                print(
+                    "Proveedor no encontrado"
+                )
+                 
 # =========================================================
 # MAIN
 # =========================================================

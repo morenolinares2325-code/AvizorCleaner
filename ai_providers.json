@@ -2,13 +2,11 @@
   "providers": [
     {
       "name": "Gemini",
-      "api_key": "",
+      "api_key": "xxxx",
       "endpoint": "",
       "model": "auto",
-      "enabled": true,
-      "status": "unknown",
-      "latency": 0,
-      "last_check": ""
+      "detected_model": "",
+      "enabled": true
     }
   ]
 }
