@@ -13,7 +13,7 @@ import shutil
 import ctypes
 from datetime import datetime
 
-# Interfaz visual mejorada con Rich
+# Interfaz visual con Rich
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -26,6 +26,7 @@ console = Console()
 CONFIG_FILE = "config.json"
 AI_PROVIDERS_FILE = "ai_providers.json"
 REPORTS_DIR = "reports"
+
 
 # =========================================================
 # AUTO-ELEVACIÓN A ADMINISTRADOR (UAC)
@@ -47,6 +48,7 @@ def request_admin_elevation():
                 sys.exit(0)
         except Exception:
             pass
+
 
 # =========================================================
 # CONFIGURATION & AI PROVIDERS
@@ -137,7 +139,7 @@ class AIValidator:
         try:
             res = requests.get(url_models, params={"key": api_key}, timeout=10)
             if res.status_code == 400:
-                return False, "API Key inválida o con formato erróneo (Error 400)."
+                return False, "API Key inválida (Error 400)."
             if res.status_code == 403:
                 return False, "Permisos insuficientes o cuota bloqueada (Error 403)."
             if res.status_code != 200:
@@ -155,7 +157,6 @@ class AIValidator:
 
             selected_model = next((m for m in valid_models if "flash" in m.lower()), valid_models[0])
 
-            # Test de generación
             url_test = f"https://generativelanguage.googleapis.com/v1beta/models/{selected_model}:generateContent"
             payload = {"contents": [{"parts": [{"text": "ping"}]}]}
             test_res = requests.post(url_test, params={"key": api_key}, json=payload, timeout=10)
@@ -167,7 +168,7 @@ class AIValidator:
                 return False, f"El modelo {selected_model} devolvió status {test_res.status_code}."
 
         except requests.exceptions.Timeout:
-            return False, "Tiempo de espera agotado al conectar con el servidor."
+            return False, "Tiempo de espera agotado al conectar con Google."
         except Exception as e:
             return False, f"Error de conexión: {str(e)}"
 
@@ -236,7 +237,324 @@ class AdvancedHealthAnalyzer:
 
 
 # =========================================================
-# NETWORK MANAGER PRO
+# LIMPIEZA BÁSICA Y PROFUNDA DE WINDOWS
+# =========================================================
+
+class Cleaner:
+    @staticmethod
+    def _delete_folder_contents(folder_path):
+        removed = 0
+        if not os.path.exists(folder_path):
+            return 0
+        for root, _, files in os.walk(folder_path):
+            for file in files:
+                try:
+                    os.remove(os.path.join(root, file))
+                    removed += 1
+                except Exception:
+                    pass
+        return removed
+
+    @staticmethod
+    def scan_temp():
+        temp_dir = tempfile.gettempdir()
+        total_size, total_files = 0, 0
+        for root, _, files in os.walk(temp_dir):
+            for file in files:
+                try:
+                    p = os.path.join(root, file)
+                    total_size += os.path.getsize(p)
+                    total_files += 1
+                except Exception:
+                    pass
+        return {"files": total_files, "size_mb": round(total_size / (1024 * 1024), 2)}
+
+    @staticmethod
+    def clean_temp():
+        return Cleaner._delete_folder_contents(tempfile.gettempdir())
+
+    @staticmethod
+    def clean_recycle_bin():
+        if os.name != "nt":
+            return "Solo disponible en Windows"
+        try:
+            res = ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 7)
+            return "Papelera vaciada con éxito." if res == 0 else "Papelera ya vacía o no disponible."
+        except Exception as e:
+            return f"Error: {e}"
+
+    @staticmethod
+    def clean_prefetch():
+        if os.name != "nt":
+            return 0
+        return Cleaner._delete_folder_contents(r"C:\Windows\Prefetch")
+
+    @staticmethod
+    def clean_logs():
+        removed = 0
+        if os.name == "nt":
+            for path in [r"C:\Windows\Logs", r"C:\Windows\Temp"]:
+                removed += Cleaner._delete_folder_contents(path)
+        return removed
+
+    @staticmethod
+    def clean_browser_cache():
+        removed = 0
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        if not local_app:
+            return 0
+
+        targets = [
+            os.path.join(local_app, r"Google\Chrome\User Data\Default\Cache"),
+            os.path.join(local_app, r"Microsoft\Edge\User Data\Default\Cache"),
+            os.path.join(local_app, r"Mozilla\Firefox\Profiles")
+        ]
+        for target in targets:
+            if "Firefox" in target and os.path.exists(target):
+                for profile in os.listdir(target):
+                    cache_dir = os.path.join(target, profile, "cache2")
+                    removed += Cleaner._delete_folder_contents(cache_dir)
+            else:
+                removed += Cleaner._delete_folder_contents(target)
+        return removed
+
+    @staticmethod
+    def clean_old_downloads(days=30):
+        downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.exists(downloads_dir):
+            return 0, 0.0
+
+        cutoff = time.time() - (days * 86400)
+        exts = {".exe", ".msi", ".iso", ".zip", ".rar", ".tar", ".gz"}
+        removed, freed_bytes = 0, 0
+
+        for file in os.listdir(downloads_dir):
+            path = os.path.join(downloads_dir, file)
+            if os.path.isfile(path):
+                ext = os.path.splitext(file)[1].lower()
+                if ext in exts and os.path.getmtime(path) < cutoff:
+                    try:
+                        sz = os.path.getsize(path)
+                        os.remove(path)
+                        freed_bytes += sz
+                        removed += 1
+                    except Exception:
+                        pass
+        return removed, round(freed_bytes / (1024 * 1024), 2)
+
+
+class WindowsDeepCleaner:
+    @staticmethod
+    def clean_directx_shaders():
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        if not local_app:
+            return 0
+        path = os.path.join(local_app, "D3DSCache")
+        return Cleaner._delete_folder_contents(path)
+
+    @staticmethod
+    def clean_crash_dumps():
+        removed = 0
+        if os.name == "nt":
+            minidump = r"C:\Windows\Minidump"
+            memory_dmp = r"C:\Windows\MEMORY.DMP"
+            removed += Cleaner._delete_folder_contents(minidump)
+            if os.path.exists(memory_dmp):
+                try:
+                    os.remove(memory_dmp)
+                    removed += 1
+                except Exception:
+                    pass
+        return removed
+
+    @staticmethod
+    def clean_windows_update():
+        if os.name != "nt":
+            return False, "Solo disponible en Windows."
+        try:
+            cmd = "dism.exe /online /cleanup-image /startcomponentcleanup /resetbase"
+            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            return res.returncode == 0, "Actualizaciones obsoletas eliminadas." if res.returncode == 0 else "Error al ejecutar DISM."
+        except Exception as e:
+            return False, str(e)
+
+
+# =========================================================
+# REPARACIÓN Y SALUD DEL SISTEMA
+# =========================================================
+
+class SystemRepairManager:
+    @staticmethod
+    def run_sfc_scan():
+        if os.name != "nt":
+            return "Solo disponible en Windows."
+        try:
+            res = subprocess.run("sfc /scannow", shell=True, capture_output=True, text=True)
+            return "SFC completado exitosamente." if res.returncode == 0 else "SFC finalizado con observaciones o errores."
+        except Exception as e:
+            return str(e)
+
+    @staticmethod
+    def run_dism_restore():
+        if os.name != "nt":
+            return "Solo disponible en Windows."
+        try:
+            res = subprocess.run("DISM /Online /Cleanup-Image /RestoreHealth", shell=True, capture_output=True, text=True)
+            return "Imagen de Windows reparada." if res.returncode == 0 else "Error al reparar imagen de Windows."
+        except Exception as e:
+            return str(e)
+
+    @staticmethod
+    def check_smart_disks():
+        if os.name != "nt":
+            return []
+        try:
+            cmd = 'powershell "Get-PhysicalDisk | Select-Object FriendlyName, MediaType, HealthStatus, OperationalStatus | ConvertTo-Json"'
+            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if res.returncode == 0 and res.stdout.strip():
+                data = json.loads(res.stdout)
+                return [data] if isinstance(data, dict) else data
+            return []
+        except Exception:
+            return []
+
+
+# =========================================================
+# AJUSTES DE RENDIMIENTO & HARDWARE
+# =========================================================
+
+class PerformanceTweaks:
+    @staticmethod
+    def enable_ultimate_performance():
+        if os.name != "nt":
+            return False, "Solo disponible en Windows."
+        try:
+            cmd = "powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61"
+            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if res.returncode == 0:
+                # Extraer GUID y activar esquema
+                guid = res.stdout.split()[3] if len(res.stdout.split()) > 3 else None
+                if guid:
+                    subprocess.run(f"powercfg /setactive {guid}", shell=True)
+                return True, "Plan de Energía 'Máximo Rendimiento' activado."
+            return False, "No se pudo desbloquear el plan de energía."
+        except Exception as e:
+            return False, str(e)
+
+    @staticmethod
+    def run_trim_ssd():
+        if os.name != "nt":
+            return False, "Solo disponible en Windows."
+        try:
+            res = subprocess.run("defrag C: /O", shell=True, capture_output=True)
+            return res.returncode == 0, "Optimización TRIM completada en el disco C:"
+        except Exception as e:
+            return False, str(e)
+
+    @staticmethod
+    def optimize_tcp_stack():
+        if os.name != "nt":
+            return False, "Solo disponible en Windows."
+        try:
+            subprocess.run("netsh int tcp set global autotuninglevel=normal", shell=True, capture_output=True)
+            return True, "Parámetros TCP Auto-Tuning configurados en modo normal."
+        except Exception as e:
+            return False, str(e)
+
+
+# =========================================================
+# PRIVACIDAD & GESTIÓN DE PROGRAMAS
+# =========================================================
+
+class PrivacyAndUninstallManager:
+    @staticmethod
+    def disable_telemetry():
+        if os.name != "nt":
+            return False, "Solo disponible en Windows."
+        try:
+            services = ["DiagTrack", "dmwappushservice"]
+            for s in services:
+                subprocess.run(f"sc stop {s}", shell=True, capture_output=True)
+                subprocess.run(f"sc config {s} start=disabled", shell=True, capture_output=True)
+            return True, "Servicios de telemetría y diagnóstico desactivados."
+        except Exception as e:
+            return False, str(e)
+
+    @staticmethod
+    def get_installed_apps():
+        if os.name != "nt":
+            return []
+        import winreg
+        installed = []
+        paths = [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall")
+        ]
+        for root, p in paths:
+            try:
+                with winreg.OpenKey(root, p) as key:
+                    for i in range(winreg.QueryInfoKey(key)[0]):
+                        try:
+                            sub_name = winreg.EnumKey(key, i)
+                            with winreg.OpenKey(key, sub_name) as sub_key:
+                                display_name, _ = winreg.QueryValueEx(sub_key, "DisplayName")
+                                uninstall_str, _ = winreg.QueryValueEx(sub_key, "UninstallString")
+                                if display_name and uninstall_str:
+                                    installed.append({"name": display_name, "cmd": uninstall_str})
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+        unique = {app["name"]: app for app in installed}
+        return sorted(unique.values(), key=lambda x: x["name"].lower())
+
+    @staticmethod
+    def uninstall_app(cmd):
+        try:
+            subprocess.Popen(cmd, shell=True)
+            return True, "Desinstalador iniciado."
+        except Exception as e:
+            return False, str(e)
+
+
+class StartupManager:
+    @staticmethod
+    def get_startup_apps():
+        if os.name != "nt":
+            return []
+        import winreg
+        startup_apps = []
+        keys = [
+            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", "Usuario Actual"),
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run", "Todo el Sistema")
+        ]
+        for root_key, subkey, scope in keys:
+            try:
+                with winreg.OpenKey(root_key, subkey) as key:
+                    for i in range(winreg.QueryInfoKey(key)[1]):
+                        name, val, _ = winreg.EnumValue(key, i)
+                        startup_apps.append({"name": name, "command": val, "scope": scope})
+            except Exception:
+                pass
+        return startup_apps
+
+    @staticmethod
+    def remove_startup_app(name, scope="Usuario Actual"):
+        if os.name != "nt":
+            return False, "Solo disponible en Windows."
+        import winreg
+        root_key = winreg.HKEY_CURRENT_USER if scope == "Usuario Actual" else winreg.HKEY_LOCAL_MACHINE
+        try:
+            with winreg.OpenKey(root_key, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, name)
+            return True, f"'{name}' eliminado del arranque."
+        except Exception as e:
+            return False, str(e)
+
+
+# =========================================================
+# NETWORK & PROCESS MANAGERS
 # =========================================================
 
 class NetworkManager:
@@ -302,199 +620,10 @@ class NetworkManager:
             subprocess.run(cmd1, shell=True, capture_output=True)
             subprocess.run(cmd2, shell=True, capture_output=True)
             subprocess.run("ipconfig /flushdns", shell=True, capture_output=True)
-            return True, f"DNS ajustados a {primary} y {secondary} en {interface_name}."
+            return True, f"DNS ajustados a {primary} y {secondary}."
         except Exception as e:
             return False, str(e)
 
-    @staticmethod
-    def reset_network_stack():
-        if os.name != "nt":
-            return False, "Solo disponible en Windows."
-        try:
-            subprocess.run("netsh winsock reset", shell=True, capture_output=True)
-            subprocess.run("netsh int ip reset", shell=True, capture_output=True)
-            subprocess.run("ipconfig /flushdns", shell=True, capture_output=True)
-            return True, "Pila de red reiniciada. Se recomienda reiniciar el equipo."
-        except Exception as e:
-            return False, str(e)
-
-
-# =========================================================
-# CLEANER PRO & ANALIZADORES DE DISCO
-# =========================================================
-
-class Cleaner:
-    @staticmethod
-    def _delete_folder_contents(folder_path):
-        removed = 0
-        if not os.path.exists(folder_path):
-            return 0
-        for root, dirs, files in os.walk(folder_path):
-            for file in files:
-                try:
-                    os.remove(os.path.join(root, file))
-                    removed += 1
-                except Exception:
-                    pass
-        return removed
-
-    @staticmethod
-    def scan_temp():
-        temp_dir = tempfile.gettempdir()
-        total_size, total_files = 0, 0
-        for root, dirs, files in os.walk(temp_dir):
-            for file in files:
-                try:
-                    p = os.path.join(root, file)
-                    total_size += os.path.getsize(p)
-                    total_files += 1
-                except Exception:
-                    pass
-        return {"files": total_files, "size_mb": round(total_size / (1024 * 1024), 2)}
-
-    @staticmethod
-    def clean_temp():
-        return Cleaner._delete_folder_contents(tempfile.gettempdir())
-
-    @staticmethod
-    def clean_recycle_bin():
-        if os.name != "nt":
-            return "Solo disponible en Windows"
-        try:
-            res = ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 7)
-            return "Papelera vaciada con éxito." if res == 0 else "Papelera ya vacía o no disponible."
-        except Exception as e:
-            return f"Error: {e}"
-
-    @staticmethod
-    def clean_prefetch():
-        if os.name != "nt":
-            return 0
-        return Cleaner._delete_folder_contents(r"C:\Windows\Prefetch")
-
-    @staticmethod
-    def clean_logs():
-        removed = 0
-        if os.name == "nt":
-            for path in [r"C:\Windows\Logs", r"C:\Windows\Temp"]:
-                removed += Cleaner._delete_folder_contents(path)
-        return removed
-
-    @staticmethod
-    def clean_browser_cache():
-        removed = 0
-        local_app = os.environ.get("LOCALAPPDATA", "")
-        if not local_app:
-            return 0
-
-        targets = [
-            os.path.join(local_app, r"Google\Chrome\User Data\Default\Cache"),
-            os.path.join(local_app, r"Microsoft\Edge\User Data\Default\Cache"),
-            os.path.join(local_app, r"Mozilla\Firefox\Profiles")
-        ]
-
-        for target in targets:
-            if "Firefox" in target and os.path.exists(target):
-                for profile in os.listdir(target):
-                    cache_dir = os.path.join(target, profile, "cache2")
-                    removed += Cleaner._delete_folder_contents(cache_dir)
-            else:
-                removed += Cleaner._delete_folder_contents(target)
-        return removed
-
-    # NUEVO: Limpiador de descargas antiguas (>30 días)
-    @staticmethod
-    def clean_old_downloads(days=30):
-        downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-        if not os.path.exists(downloads_dir):
-            return 0, 0.0
-
-        now = time.time()
-        cutoff = now - (days * 86400)
-        exts = {".exe", ".msi", ".iso", ".zip", ".rar", ".tar", ".gz"}
-        removed, freed_bytes = 0, 0
-
-        for file in os.listdir(downloads_dir):
-            path = os.path.join(downloads_dir, file)
-            if os.path.isfile(path):
-                ext = os.path.splitext(file)[1].lower()
-                if ext in exts and os.path.getmtime(path) < cutoff:
-                    try:
-                        sz = os.path.getsize(path)
-                        os.remove(path)
-                        freed_bytes += sz
-                        removed += 1
-                    except Exception:
-                        pass
-        return removed, round(freed_bytes / (1024 * 1024), 2)
-
-
-# NUEVO: Analizador de Archivos Grandes en Disco
-class DiskAnalyzer:
-    @staticmethod
-    def find_large_files(min_size_mb=100, limit=10):
-        user_home = os.path.expanduser("~")
-        search_dirs = [
-            os.path.join(user_home, "Downloads"),
-            os.path.join(user_home, "Documents"),
-            os.path.join(user_home, "Desktop"),
-            os.path.join(user_home, "Videos")
-        ]
-
-        min_bytes = min_size_mb * 1024 * 1024
-        large_files = []
-
-        for d in search_dirs:
-            if not os.path.exists(d):
-                continue
-            for root, _, files in os.walk(d):
-                for f in files:
-                    try:
-                        fp = os.path.join(root, f)
-                        sz = os.path.getsize(fp)
-                        if sz >= min_bytes:
-                            large_files.append({
-                                "name": f,
-                                "path": fp,
-                                "size_mb": round(sz / (1024 * 1024), 2)
-                            })
-                    except Exception:
-                        pass
-
-        large_files.sort(key=lambda x: x["size_mb"], reverse=True)
-        return large_files[:limit]
-
-
-# NUEVO: Gestor de Aplicaciones de Inicio (Windows Registry)
-class StartupManager:
-    @staticmethod
-    def get_startup_apps():
-        if os.name != "nt":
-            return []
-
-        import winreg
-        startup_apps = []
-        keys = [
-            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", "Usuario Actual"),
-            (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run", "Todo el Sistema")
-        ]
-
-        for root_key, subkey, scope in keys:
-            try:
-                with winreg.OpenKey(root_key, subkey) as key:
-                    count = winreg.QueryInfoKey(key)[1]
-                    for i in range(count):
-                        name, val, _ = winreg.EnumValue(key, i)
-                        startup_apps.append({"name": name, "command": val, "scope": scope})
-            except Exception:
-                pass
-
-        return startup_apps
-
-
-# =========================================================
-# PROCESS & RAM OPTIMIZER
-# =========================================================
 
 class ProcessManager:
     @staticmethod
@@ -541,20 +670,6 @@ class ProcessManager:
                     continue
         return freed
 
-    @staticmethod
-    def kill_process(pid):
-        try:
-            p = psutil.Process(pid)
-            n = p.name()
-            p.terminate()
-            return True, f"Proceso {n} (PID: {pid}) finalizado."
-        except psutil.NoSuchProcess:
-            return False, "El proceso no existe."
-        except psutil.AccessDenied:
-            return False, "Acceso denegado (ejecuta como administrador)."
-        except Exception as e:
-            return False, str(e)
-
 
 class ReportGenerator:
     @staticmethod
@@ -578,105 +693,181 @@ class ReportGenerator:
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(report_data, f, indent=4, ensure_ascii=False)
         return filename
+
 # =========================================================
-# MENUS CON ESTILO RICH
+# MENUS
 # =========================================================
 
 def cleaner_menu():
     while True:
         console.clear()
-        console.print(Panel("[bold cyan]MODULO DE LIMPIEZA DEL SISTEMA[/bold cyan]", box=box.ROUNDED))
-        console.print("[1] Escanear archivos TEMP")
-        console.print("[2] Limpiar carpeta TEMP")
-        console.print("[3] Vaciar Papelera de Reciclaje")
-        console.print("[4] Limpiar Caché de Navegadores (Chrome/Edge/Firefox)")
-        console.print("[5] Limpiar Prefetch y Logs")
-        console.print("[6] Limpiar instaladores antiguos en Descargas (>30 días)")
-        console.print("[7] [bold green]LIMPIEZA TOTAL AUTOMÁTICA[/bold green]")
+        console.print(Panel("[bold cyan]CENTRO DE LIMPIEZA & ESPACIO[/bold cyan]", box=box.ROUNDED))
+        console.print("[1] Escanear y Limpiar Temporales (TEMP)")
+        console.print("[2] Vaciar Papelera de Reciclaje")
+        console.print("[3] Limpiar Caché de Navegadores (Chrome/Edge/Firefox)")
+        console.print("[4] Limpiar Shaders DirectX y Crash Dumps")
+        console.print("[5] Limpiar Prefetch y Logs del Sistema")
+        console.print("[6] Limpiar Actualizaciones Obsoletas de Windows (DISM)")
+        console.print("[7] Limpiar Instaladores Antiguos en Descargas (>30 días)")
+        console.print("[8] [bold green]MANTENIMIENTO Y LIMPIEZA COMPLETA[/bold green]")
         console.print("[0] Volver al menú principal\n")
 
         opt = Prompt.ask("[bold yellow]Seleccione una opción[/bold yellow]", default="0")
 
         if opt == "1":
-            with console.status("[bold green]Escaneando temporales..."):
-                res = Cleaner.scan_temp()
-            console.print(f"\n[green]TEMP:[/green] {res['files']} archivos | [cyan]{res['size_mb']} MB[/cyan] recuperables.")
+            rem = Cleaner.clean_temp()
+            console.print(f"[green]Eliminados {rem} archivos temporales.[/green]")
             Prompt.ask("\nPresione Enter para continuar")
         elif opt == "2":
-            with console.status("[bold red]Eliminando temporales..."):
-                rem = Cleaner.clean_temp()
-            console.print(f"\n[green]Completado:[/green] Se eliminaron {rem} archivos temporales.")
+            console.print(f"[cyan]{Cleaner.clean_recycle_bin()}[/cyan]")
             Prompt.ask("\nPresione Enter para continuar")
         elif opt == "3":
-            console.print(f"\n[cyan]{Cleaner.clean_recycle_bin()}[/cyan]")
+            rem = Cleaner.clean_browser_cache()
+            console.print(f"[green]Eliminados {rem} archivos de caché de navegadores.[/green]")
             Prompt.ask("\nPresione Enter para continuar")
         elif opt == "4":
-            with console.status("[bold cyan]Limpiando navegadores..."):
-                rem = Cleaner.clean_browser_cache()
-            console.print(f"\n[green]Completado:[/green] Se eliminaron {rem} archivos de caché.")
+            dx = WindowsDeepCleaner.clean_directx_shaders()
+            dumps = WindowsDeepCleaner.clean_crash_dumps()
+            console.print(f"[green]Eliminados {dx} shaders DirectX y {dumps} volcados de memoria.[/green]")
             Prompt.ask("\nPresione Enter para continuar")
         elif opt == "5":
             p = Cleaner.clean_prefetch()
             l = Cleaner.clean_logs()
-            console.print(f"\n[green]Completado:[/green] Prefetch ({p} archivos) | Logs ({l} archivos).")
+            console.print(f"[green]Eliminados {p} archivos Prefetch y {l} logs.[/green]")
             Prompt.ask("\nPresione Enter para continuar")
         elif opt == "6":
-            count, mb = Cleaner.clean_old_downloads(30)
-            console.print(f"\n[green]Descargas antiguas eliminadas:[/green] {count} archivos ({mb} MB liberados).")
+            with console.status("[bold cyan]Ejecutando limpieza de paquetes con DISM (puede tardar minutos)..."):
+                ok, msg = WindowsDeepCleaner.clean_windows_update()
+            console.print(f"[bold]{msg}[/bold]")
             Prompt.ask("\nPresione Enter para continuar")
         elif opt == "7":
-            with console.status("[bold green]Ejecutando mantenimiento profundo..."):
+            c, mb = Cleaner.clean_old_downloads(30)
+            console.print(f"[green]Descargas eliminadas:[/green] {c} archivos ({mb} MB liberados).")
+            Prompt.ask("\nPresione Enter para continuar")
+        elif opt == "8":
+            with console.status("[bold green]Limpieza profunda en curso..."):
                 t = Cleaner.clean_temp()
                 b = Cleaner.clean_browser_cache()
                 p = Cleaner.clean_prefetch()
                 l = Cleaner.clean_logs()
-                d_c, d_mb = Cleaner.clean_old_downloads(30)
+                dx = WindowsDeepCleaner.clean_directx_shaders()
                 r = Cleaner.clean_recycle_bin()
-            console.print(f"\n[bold green]Mantenimiento terminado:[/bold green]\n- TEMP: {t}\n- Navegadores: {b}\n- Prefetch: {p}\n- Logs: {l}\n- Descargas: {d_c} ({d_mb} MB)\n- {r}")
+            console.print(f"\n[bold green]Limpieza terminada:[/bold green]\n- TEMP: {t} | Navegadores: {b} | Shaders: {dx} | Prefetch: {p} | Logs: {l}\n- {r}")
             Prompt.ask("\nPresione Enter para continuar")
         elif opt == "0":
             break
 
 
-def disk_analyzer_menu():
-    console.clear()
-    console.print(Panel("[bold cyan]ANALIZADOR DE ARCHIVOS GRANDES (>100 MB)[/bold cyan]", box=box.ROUNDED))
-    with console.status("[bold yellow]Rastreando carpetas del usuario..."):
-        files = DiskAnalyzer.find_large_files(min_size_mb=100, limit=10)
+def performance_and_repair_menu():
+    while True:
+        console.clear()
+        console.print(Panel("[bold cyan]RENDIMIENTO, HARDWARE & REPARACIÓN[/bold cyan]", box=box.ROUNDED))
+        console.print("[1] Activar Plan de Energía 'Máximo Rendimiento' (Ultimate)")
+        console.print("[2] Ejecutar TRIM / Optimización en SSD (defrag /O)")
+        console.print("[3] Optimizar Pila TCP (Auto-Tuning)")
+        console.print("[4] Comprobar Integridad del Sistema (SFC /scannow)")
+        console.print("[5] Reparar Imagen de Windows (DISM RestoreHealth)")
+        console.print("[6] Diagnóstico de Salud de Discos (S.M.A.R.T.)")
+        console.print("[7] Desactivar Telemetría y Rastreo de Windows")
+        console.print("[0] Volver\n")
 
-    if not files:
-        console.print("[green]No se encontraron archivos mayores a 100 MB en Descargas, Documentos o Escritorio.[/green]")
-    else:
-        table = Table(title="Top Archivos Más Pesados", box=box.SIMPLE_HEAVY)
-        table.add_column("Tamaño (MB)", justify="right", style="bold yellow")
-        table.add_column("Nombre", style="bold white")
-        table.add_column("Ruta Completa", style="dim")
+        opt = Prompt.ask("[bold yellow]Seleccione una opción[/bold yellow]", default="0")
 
-        for f in files:
-            table.add_row(str(f["size_mb"]), f["name"], f["path"])
-        console.print(table)
+        if opt == "1":
+            ok, msg = PerformanceTweaks.enable_ultimate_performance()
+            console.print(f"[bold]{msg}[/bold]")
+            Prompt.ask("\nPresione Enter para continuar")
+        elif opt == "2":
+            with console.status("[bold cyan]Enviando comando TRIM al SSD..."):
+                ok, msg = PerformanceTweaks.run_trim_ssd()
+            console.print(f"[bold]{msg}[/bold]")
+            Prompt.ask("\nPresione Enter para continuar")
+        elif opt == "3":
+            ok, msg = PerformanceTweaks.optimize_tcp_stack()
+            console.print(f"[bold]{msg}[/bold]")
+            Prompt.ask("\nPresione Enter para continuar")
+        elif opt == "4":
+            with console.status("[bold yellow]Comprobando archivos de sistema (puede tardar unos minutos)..."):
+                msg = SystemRepairManager.run_sfc_scan()
+            console.print(f"[bold]{msg}[/bold]")
+            Prompt.ask("\nPresione Enter para continuar")
+        elif opt == "5":
+            with console.status("[bold yellow]Descargando y reparando componentes dañados de Windows..."):
+                msg = SystemRepairManager.run_dism_restore()
+            console.print(f"[bold]{msg}[/bold]")
+            Prompt.ask("\nPresione Enter para continuar")
+        elif opt == "6":
+            disks = SystemRepairManager.check_smart_disks()
+            if not disks:
+                console.print("[yellow]No se pudo leer la información S.M.A.R.T. o no estás en Windows.[/yellow]")
+            else:
+                table = Table(title="Estado S.M.A.R.T. de Discos", box=box.SIMPLE)
+                table.add_column("Disco", style="bold white")
+                table.add_column("Tipo", style="cyan")
+                table.add_column("Salud", style="bold green")
+                table.add_column("Estado", style="magenta")
+                for d in disks:
+                    table.add_row(str(d.get("FriendlyName")), str(d.get("MediaType")), str(d.get("HealthStatus")), str(d.get("OperationalStatus")))
+                console.print(table)
+            Prompt.ask("\nPresione Enter para continuar")
+        elif opt == "7":
+            ok, msg = PrivacyAndUninstallManager.disable_telemetry()
+            console.print(f"[bold]{msg}[/bold]")
+            Prompt.ask("\nPresione Enter para continuar")
+        elif opt == "0":
+            break
 
-    Prompt.ask("\nPresione Enter para volver")
 
+def programs_and_startup_menu():
+    while True:
+        console.clear()
+        console.print(Panel("[bold cyan]GESTIÓN DE PROGRAMAS & INICIO[/bold cyan]", box=box.ROUNDED))
+        console.print("[1] Ver Programas que Inician con Windows")
+        console.print("[2] Desactivar un Programa del Inicio")
+        console.print("[3] Desinstalar Aplicaciones Instaladas")
+        console.print("[0] Volver\n")
 
-def startup_menu():
-    console.clear()
-    console.print(Panel("[bold cyan]PROGRAMAS DE INICIO (WINDOWS REGISTRY)[/bold cyan]", box=box.ROUNDED))
-    apps = StartupManager.get_startup_apps()
+        opt = Prompt.ask("[bold yellow]Seleccione una opción[/bold yellow]", default="0")
 
-    if not apps:
-        console.print("[yellow]No se detectaron programas de inicio o no estás en Windows.[/yellow]")
-    else:
-        table = Table(title="Aplicaciones al Iniciar Windows", box=box.SIMPLE_HEAVY)
-        table.add_column("Aplicación", style="bold cyan")
-        table.add_column("Ámbito", style="magenta")
-        table.add_column("Comando / Ruta", style="dim")
-
-        for a in apps:
-            table.add_row(a["name"], a["scope"], a["command"])
-        console.print(table)
-
-    Prompt.ask("\nPresione Enter para volver")
+        if opt == "1":
+            apps = StartupManager.get_startup_apps()
+            if not apps:
+                console.print("[yellow]No se encontraron programas de inicio o no estás en Windows.[/yellow]")
+            else:
+                table = Table(title="Programas de Arranque", box=box.SIMPLE)
+                table.add_column("Nombre", style="bold cyan")
+                table.add_column("Ámbito", style="magenta")
+                table.add_column("Comando", style="dim")
+                for a in apps:
+                    table.add_row(a["name"], a["scope"], a["command"])
+                console.print(table)
+            Prompt.ask("\nPresione Enter para continuar")
+        elif opt == "2":
+            name = Prompt.ask("Nombre exacto del programa a quitar del inicio")
+            scope = Prompt.ask("Ámbito (1: Usuario Actual, 2: Todo el Sistema)", default="1")
+            sc_val = "Usuario Actual" if scope == "1" else "Todo el Sistema"
+            ok, msg = StartupManager.remove_startup_app(name, sc_val)
+            console.print(f"[bold]{msg}[/bold]")
+            Prompt.ask("\nPresione Enter para continuar")
+        elif opt == "3":
+            apps = PrivacyAndUninstallManager.get_installed_apps()
+            if not apps:
+                console.print("[yellow]No se pudieron listar las aplicaciones instaladas.[/yellow]")
+            else:
+                table = Table(title="Aplicaciones Detectadas", box=box.SIMPLE)
+                table.add_column("ID", style="dim")
+                table.add_column("Nombre del Programa", style="bold white")
+                for idx, app in enumerate(apps[:25], 1):
+                    table.add_row(str(idx), app["name"])
+                console.print(table)
+                sel = Prompt.ask("\nIntroduce el ID para desinstalar (o 0 para cancelar)", default="0")
+                if sel.isdigit() and 1 <= int(sel) <= len(apps[:25]):
+                    target = apps[int(sel) - 1]
+                    ok, msg = PrivacyAndUninstallManager.uninstall_app(target["cmd"])
+                    console.print(f"[bold]{msg}[/bold]")
+            Prompt.ask("\nPresione Enter para continuar")
+        elif opt == "0":
+            break
 
 
 def network_menu():
@@ -686,8 +877,7 @@ def network_menu():
         console.print("[1] Diagnóstico de IPs y Latencia")
         console.print("[2] Asignar DNS Rápidos de Cloudflare (1.1.1.1)")
         console.print("[3] Vaciar Caché DNS (Flush DNS)")
-        console.print("[4] Reinicio Completo de Pila de Red (Winsock Reset)")
-        console.print("[5] Test de Velocidad (SpeedTest)")
+        console.print("[4] Test de Velocidad (SpeedTest)")
         console.print("[0] Volver\n")
 
         opt = Prompt.ask("[bold yellow]Seleccione una opción[/bold yellow]", default="0")
@@ -705,68 +895,15 @@ def network_menu():
             Prompt.ask("\nPresione Enter para continuar")
         elif opt == "3":
             ok = NetworkManager.flush_dns()
-            console.print("[green]Caché DNS vaciada.[/green]" if ok else "[red]Error al vaciar caché DNS.[/red]")
+            console.print("[green]Caché DNS vaciada.[/green]" if ok else "[red]Error al vaciar DNS.[/red]")
             Prompt.ask("\nPresione Enter para continuar")
         elif opt == "4":
-            ok, msg = NetworkManager.reset_network_stack()
-            console.print(f"[bold]{msg}[/bold]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "5":
-            with console.status("[bold cyan]Midiendo velocidad de conexión..."):
+            with console.status("[bold cyan]Midiendo ancho de banda..."):
                 res = NetworkManager.speed_test()
             if res["success"]:
                 console.print(f"[green]Descarga:[/green] {res['download']} Mbps | [green]Subida:[/green] {res['upload']} Mbps | [cyan]Ping:[/cyan] {res['ping']} ms")
             else:
                 console.print(f"[red]Error:[/red] {res['error']}")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "0":
-            break
-
-
-def process_menu():
-    while True:
-        console.clear()
-        console.print(Panel("[bold cyan]PROCESOS Y OPTIMIZACIÓN DE MEMORIA[/bold cyan]", box=box.ROUNDED))
-        console.print("[1] Top Procesos por CPU")
-        console.print("[2] Top Procesos por Memoria RAM")
-        console.print("[3] [bold green]COMPACTAR MEMORIA RAM (Trim Working Sets)[/bold green]")
-        console.print("[4] Finalizar Proceso por PID")
-        console.print("[0] Volver\n")
-
-        opt = Prompt.ask("[bold yellow]Seleccione una opción[/bold yellow]", default="0")
-
-        if opt == "1":
-            table = Table(title="Top Consumo de CPU", box=box.SIMPLE)
-            table.add_column("PID", style="dim")
-            table.add_column("CPU %", style="bold red")
-            table.add_column("Nombre", style="bold white")
-            for p in ProcessManager.top_cpu_processes(7):
-                table.add_row(str(p["pid"]), f"{p['cpu_percent']}%", p["name"])
-            console.print(table)
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "2":
-            table = Table(title="Top Consumo de RAM", box=box.SIMPLE)
-            table.add_column("PID", style="dim")
-            table.add_column("RAM %", style="bold yellow")
-            table.add_column("Uso Real (MB)", style="cyan")
-            table.add_column("Nombre", style="bold white")
-            for p in ProcessManager.top_ram_processes(7):
-                table.add_row(str(p["pid"]), f"{p['memory_percent']}%", f"{p['memory_mb']} MB", p["name"])
-            console.print(table)
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "3":
-            with console.status("[bold green]Optimizando memoria activa..."):
-                before = psutil.virtual_memory().available
-                count = ProcessManager.optimize_ram()
-                after = psutil.virtual_memory().available
-                freed = max(0, round((after - before) / (1024 * 1024), 2))
-            console.print(f"\n[bold green]Procesos compactados:[/bold green] {count} | [bold cyan]RAM recuperada:[/bold cyan] {freed} MB")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "4":
-            pid_in = Prompt.ask("Introduce el PID a finalizar")
-            if pid_in.isdigit():
-                ok, msg = ProcessManager.kill_process(int(pid_in))
-                console.print(f"[bold]{msg}[/bold]")
             Prompt.ask("\nPresione Enter para continuar")
         elif opt == "0":
             break
@@ -791,11 +928,11 @@ def ai_hub_menu():
             Prompt.ask("\nPresione Enter para continuar")
         elif opt == "2":
             key = Prompt.ask("Pega tu API Key de Gemini")
-            with console.status("[bold cyan]Validando credenciales..."):
+            with console.status("[bold cyan]Validando credenciales con Google..."):
                 ok, model = AIValidator.auto_detect_and_bind("Gemini", key)
             if ok:
                 AIProviderManager.add_provider("Gemini", key, model=model)
-                console.print(f"\n[green]Éxito:[/green] API Key vinculada al modelo [bold cyan]{model}[/bold cyan]")
+                console.print(f"\n[green]Éxito:[/green] API Key vinculada y funcionando con [bold cyan]{model}[/bold cyan]")
             else:
                 AIProviderManager.add_provider("Gemini", key)
                 console.print(f"\n[yellow]Aviso:[/yellow] {model}")
@@ -833,7 +970,7 @@ def main():
         header_table.add_column("Col1", style="bold white")
         header_table.add_column("Col2", style="bold cyan")
 
-        header_table.add_row(f"AVIZOR CLEANER PRO v1.1 {admin_txt}", f"Host: {info['hostname']} ({info['os']})")
+        header_table.add_row(f"AVIZOR CLEANER PRO v1.2 {admin_txt}", f"Host: {info['hostname']} ({info['os']})")
         header_table.add_row(
             f"Salud: [{health['color']}]{health['score']}/100 ({health['status']})[/{health['color']}]",
             f"CPU: {info['cpu_usage']}% | RAM: {info['ram_usage']}% ({info['ram_free_gb']} GB libres)"
@@ -845,11 +982,11 @@ def main():
         console.print(header_table)
 
         console.print("\n[bold]Panel de Control:[/bold]")
-        console.print("[1] Limpiador del Sistema & Navegadores (Cleaner)")
-        console.print("[2] Optimización de Memoria RAM & Procesos")
-        console.print("[3] Conectividad, DNS & Red")
-        console.print("[4] Analizador de Archivos Grandes (>100 MB)")
-        console.print("[5] Aplicaciones de Inicio (Windows Registry)")
+        console.print("[1] Limpiador del Sistema, Navegadores y Windows Update")
+        console.print("[2] Rendimiento, SSD TRIM, Reparación SFC & Hardware")
+        console.print("[3] Gestión de Programas, Desinstalador e Inicio")
+        console.print("[4] Optimización de Memoria RAM & Procesos")
+        console.print("[5] Conectividad, DNS Rápidos & Red")
         console.print("[6] AI Hub (Autovinculación & Diagnóstico LLM)")
         console.print("[7] Exportar Informe JSON")
         console.print("[0] Salir\n")
@@ -859,19 +996,25 @@ def main():
         if opt == "1":
             cleaner_menu()
         elif opt == "2":
-            process_menu()
+            performance_and_repair_menu()
         elif opt == "3":
-            network_menu()
+            programs_and_startup_menu()
         elif opt == "4":
-            disk_analyzer_menu()
+            with console.status("[bold green]Compactando memoria..."):
+                before = psutil.virtual_memory().available
+                count = ProcessManager.optimize_ram()
+                after = psutil.virtual_memory().available
+                freed = max(0, round((after - before) / (1024 * 1024), 2))
+            console.print(f"\n[green]Memoria compactada en {count} procesos. Liberados: {freed} MB.[/green]")
+            Prompt.ask("\nPresione Enter para continuar")
         elif opt == "5":
-            startup_menu()
+            network_menu()
         elif opt == "6":
             ai_hub_menu()
         elif opt == "7":
             with console.status("[bold cyan]Exportando informe..."):
                 p = ReportGenerator.generate_full_report()
-            console.print(f"\n[green]Guardado en:[/green] {p}")
+            console.print(f"\n[green]Reporte generado en:[/green] {p}")
             Prompt.ask("\nPresione Enter para continuar")
         elif opt == "0":
             console.print("\n[bold cyan]Cerrando AvizorCleaner.[/bold cyan]")
