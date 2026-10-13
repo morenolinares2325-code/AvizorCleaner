@@ -1,18 +1,14 @@
 {
-    "providers": [
-        {
-            "name": "Gemini",
-            "api_key": "",
-            "endpoint": "",
-            "model": "auto",
-            "enabled": true
-        },
-        {
-            "name": "openai",
-            "api_key": "test",
-            "endpoint": "",
-            "model": "auto",
-            "enabled": true
-        }
-    ]
+  "providers": [
+    {
+      "name": "Gemini",
+      "api_key": "",
+      "endpoint": "",
+      "model": "auto",
+      "enabled": true,
+      "status": "unknown",
+      "latency": 0,
+      "last_check": ""
+    }
+  ]
 }

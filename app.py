@@ -1,23 +1,19 @@
 import os
 import json
+import time
 import socket
 import platform
 import tempfile
+import subprocess
 import requests
 import psutil
+import speedtest
 
 from datetime import datetime
-
-# =========================================================
-# ARCHIVOS
-# =========================================================
 
 CONFIG_FILE = "config.json"
 AI_PROVIDERS_FILE = "ai_providers.json"
 
-# =========================================================
-# CONFIGURACIÓN
-# =========================================================
 
 class ConfigurationManager:
 
@@ -53,11 +49,6 @@ class ConfigurationManager:
                 indent=4,
                 ensure_ascii=False
             )
-
-# =========================================================
-# AI HUB
-# =========================================================
-
 class AIProviderManager:
 
     @staticmethod
@@ -111,7 +102,10 @@ class AIProviderManager:
                 "api_key": api_key,
                 "endpoint": endpoint,
                 "model": model,
-                "enabled": True
+                "enabled": True,
+                "status": "unknown",
+                "latency": 0,
+                "last_check": ""
             }
         )
 
@@ -123,9 +117,13 @@ class AIProviderManager:
         data = AIProviderManager.load_providers()
 
         data["providers"] = [
+
             p
+
             for p in data["providers"]
+
             if p["name"].lower() != name.lower()
+
         ]
 
         AIProviderManager.save_providers(data)
@@ -159,13 +157,43 @@ class AIProviderManager:
     @staticmethod
     def get_all():
 
-        data = AIProviderManager.load_providers()
+        return AIProviderManager.load_providers()["providers"]
 
-        return data["providers"]
-# =========================================================
-# INFORMACIÓN DEL SISTEMA
-# =========================================================
 
+class AIValidator:
+
+    @staticmethod
+    def check_provider(provider):
+
+        start = time.time()
+
+        api_key = provider.get(
+            "api_key",
+            ""
+        )
+
+        if not api_key:
+
+            return {
+                "success": False,
+                "message": "API Key vacía"
+            }
+
+        latency = round(
+            time.time() - start,
+            3
+        )
+
+        return {
+
+            "success": True,
+
+            "message":
+            "Configuración encontrada",
+
+            "latency":
+            latency
+        }
 class SystemInfo:
 
     @staticmethod
@@ -181,37 +209,55 @@ class SystemInfo:
 
             "hostname": platform.node(),
 
+            "processor": platform.processor(),
+
             "os": platform.system(),
 
-            "os_version": platform.version(),
+            "cpu_usage":
+            psutil.cpu_percent(
+                interval=1
+            ),
 
-            "cpu_usage": psutil.cpu_percent(interval=1),
+            "cpu_cores":
+            psutil.cpu_count(),
 
-            "cpu_cores": psutil.cpu_count(logical=True),
+            "ram_usage":
+            vm.percent,
 
-            "ram_usage": vm.percent,
-
-            "ram_total_gb": round(
-                vm.total / (1024 ** 3),
+            "ram_total_gb":
+            round(
+                vm.total / (1024**3),
                 2
             ),
 
-            "disk_usage": disk.percent,
-
-            "disk_total_gb": round(
-                disk.total / (1024 ** 3),
+            "ram_free_gb":
+            round(
+                vm.available / (1024**3),
                 2
             ),
 
-            "timestamp": datetime.now().strftime(
+            "disk_usage":
+            disk.percent,
+
+            "disk_total_gb":
+            round(
+                disk.total / (1024**3),
+                2
+            ),
+
+            "disk_free_gb":
+            round(
+                disk.free / (1024**3),
+                2
+            ),
+
+            "timestamp":
+            datetime.now()
+            .strftime(
                 "%d/%m/%Y %H:%M:%S"
             )
         }
 
-
-# =========================================================
-# HEALTH SCORE
-# =========================================================
 
 class HealthAnalyzer:
 
@@ -220,75 +266,76 @@ class HealthAnalyzer:
 
         score = 100
 
-        recommendations = []
-
         if info["cpu_usage"] > 80:
-
             score -= 20
-
-            recommendations.append(
-                "CPU elevada. Revisar procesos."
-            )
 
         if info["ram_usage"] > 80:
-
             score -= 20
-
-            recommendations.append(
-                "RAM elevada. Liberar memoria."
-            )
 
         if info["disk_usage"] > 90:
-
             score -= 20
 
-            recommendations.append(
-                "Disco casi lleno."
+        return score
+
+
+class AdvancedHealthAnalyzer:
+
+    @staticmethod
+    def calculate():
+
+        info = SystemInfo.get_info()
+
+        cpu_score = max(
+            0,
+            25 - int(
+                info["cpu_usage"] / 4
             )
+        )
 
-        if score >= 80:
+        ram_score = max(
+            0,
+            25 - int(
+                info["ram_usage"] / 4
+            )
+        )
 
-            status = "OPTIMO"
+        disk_score = max(
+            0,
+            20 - int(
+                info["disk_usage"] / 5
+            )
+        )
 
-        elif score >= 60:
-
-            status = "ACEPTABLE"
-
-        else:
-
-            status = "CRITICO"
+        total = (
+            cpu_score
+            + ram_score
+            + disk_score
+        )
 
         return {
-            "score": score,
-            "status": status,
-            "recommendations": recommendations
+            "score": total
         }
 
-
 # =========================================================
-# RED
+# NETWORK MANAGER
 # =========================================================
-
 class NetworkManager:
 
     @staticmethod
     def get_network_usage():
 
-        net = psutil.net_io_counters()
-
-        return {
-            "bytes_sent": net.bytes_sent,
-            "bytes_received": net.bytes_recv,
-            "packets_sent": net.packets_sent,
-            "packets_received": net.packets_recv
-        }
+        return psutil.net_io_counters()
 
     @staticmethod
     def format_bytes(value):
 
-        units = ["B", "KB", "MB", "GB", "TB"]
-
-        for unit in units:
+        for unit in [
+            "B",
+            "KB",
+            "MB",
+            "GB",
+            "TB"
+        ]:
 
             if value < 1024:
 
@@ -308,7 +355,9 @@ class NetworkManager:
                 socket.SOCK_DGRAM
             )
 
-            s.connect(("8.8.8.8", 80))
+            s.connect(
+                ("8.8.8.8", 80)
+            )
 
             ip = s.getsockname()[0]
 
@@ -316,7 +365,7 @@ class NetworkManager:
 
             return ip
 
-        except Exception:
+        except:
 
             return "No disponible"
 
@@ -325,61 +374,181 @@ class NetworkManager:
 
         try:
 
-            response = requests.get(
+            return requests.get(
                 "https://api.ipify.org",
                 timeout=5
-            )
+            ).text
 
-            return response.text
-
-        except Exception:
+        except:
 
             return "No disponible"
 
+    @staticmethod
+    def ping_google():
 
-# =========================================================
-# CLEANER
-# =========================================================
+        try:
+
+            command = (
+                ["ping", "-n", "1", "8.8.8.8"]
+                if os.name == "nt"
+                else
+                ["ping", "-c", "1", "8.8.8.8"]
+            )
+
+            result = subprocess.run(
+                command,
+                capture_output=True
+            )
+
+            return result.returncode == 0
+
+        except:
+
+            return False
+    @staticmethod
+    def ping_host(host="8.8.8.8"):
+
+        try:
+
+            command = (
+                ["ping", "-n", "1", host]
+                if os.name == "nt"
+                else
+                ["ping", "-c", "1", host]
+            )
+
+            start = time.time()
+
+            result = subprocess.run(
+                command,
+                capture_output=True
+            )
+
+            if result.returncode == 0:
+
+                return round(
+                    (time.time() - start) * 1000,
+                    2
+                )
+
+            return -1
+
+        except Exception:
+
+            return -1      
+    @staticmethod
+    def speed_test():
+
+        try:
+
+            st = speedtest.Speedtest()
+
+            download = round(
+                st.download() / 1000000,
+                2
+            )
+
+            upload = round(
+                st.upload() / 1000000,
+                2
+            )
+
+            ping = round(
+                st.results.ping,
+                2
+            )
+
+            return {
+                "success": True,
+                "download": download,
+                "upload": upload,
+                "ping": ping
+            }
+
+        except Exception as e:
+
+            return {
+                "success": False,
+                "error": str(e)
+            }
 
 class Cleaner:
 
     @staticmethod
-    def get_temp_folder():
-
-        return tempfile.gettempdir()
-
-    @staticmethod
     def scan_temp():
 
-        temp_dir = Cleaner.get_temp_folder()
+        temp_dir = tempfile.gettempdir()
 
         total_size = 0
 
         total_files = 0
 
-        for root, dirs, files in os.walk(temp_dir):
+        for root, dirs, files in os.walk(
+            temp_dir
+        ):
 
             for file in files:
 
                 try:
 
-                    path = os.path.join(root, file)
+                    path = os.path.join(
+                        root,
+                        file
+                    )
 
-                    total_size += os.path.getsize(path)
+                    total_size += (
+                        os.path.getsize(path)
+                    )
 
                     total_files += 1
 
-                except Exception:
+                except:
                     pass
 
         return {
             "files": total_files,
             "size_mb": round(
-                total_size / (1024 * 1024),
+                total_size /
+                (1024 * 1024),
                 2
             )
         }
-# =========================================================
+
+
+class ProcessManager:
+
+    @staticmethod
+    def top_processes(
+        limit=5
+    ):
+
+        processes = []
+
+        for proc in psutil.process_iter(
+            [
+                "pid",
+                "name",
+                "cpu_percent"
+            ]
+        ):
+
+            try:
+
+                processes.append(
+                    proc.info
+                )
+
+            except:
+                pass
+
+        processes.sort(
+            key=lambda x:
+            x["cpu_percent"],
+            reverse=True
+        )
+
+        return processes[:limit]
+   # =========================================================
 # AI HUB MENU
 # =========================================================
 
@@ -388,34 +557,29 @@ def ai_hub_menu():
     while True:
 
         print()
-        print("========== AI HUB ==========")
-        print("1. Ver proveedores")
-        print("2. Añadir proveedor")
-        print("3. Eliminar proveedor")
-        print("4. Activar proveedor")
-        print("5. Desactivar proveedor")
-        print("0. Volver")
-        print()
+        print("AI HUB")
+        print("1. Ver")
+        print("2. Añadir")
+        print("3. Eliminar")
+        print("4. Activar")
+        print("5. Desactivar")
+        print("6. Verificar")
+        print("7. SpeedTest")
+        print("0. Salir")
 
-        option = input("Opción: ")
+        option = input("> ")
 
         if option == "1":
 
             providers = AIProviderManager.get_all()
 
-            if not providers:
+            for p in providers:
 
-                print("No hay proveedores")
-
-            else:
-
-                for provider in providers:
-
-                    print(
-                        f"{provider['name']} | "
-                        f"{provider['model']} | "
-                        f"{'ACTIVO' if provider['enabled'] else 'DESACTIVADO'}"
-                    )
+                print(
+                    p["name"],
+                    "|",
+                    p["model"]
+                )
 
         elif option == "2":
 
@@ -423,40 +587,97 @@ def ai_hub_menu():
             key = input("API Key: ")
 
             AIProviderManager.add_provider(
-                name=name,
-                api_key=key
+                name,
+                key
             )
-
-            print("Proveedor añadido.")
 
         elif option == "3":
 
-            name = input("Proveedor a eliminar: ")
+            name = input("Nombre: ")
 
-            AIProviderManager.remove_provider(name)
-
-            print("Proveedor eliminado.")
+            AIProviderManager.remove_provider(
+                name
+            )
 
         elif option == "4":
 
-            name = input("Proveedor: ")
-
-            AIProviderManager.enable_provider(name)
-
-            print("Proveedor activado.")
+            AIProviderManager.enable_provider(
+                input("Proveedor: ")
+            )
 
         elif option == "5":
 
+            AIProviderManager.disable_provider(
+                input("Proveedor: ")
+            )
+
+        elif option == "6":
+
             name = input("Proveedor: ")
 
-            AIProviderManager.disable_provider(name)
+            providers = (
+                AIProviderManager.get_all()
+            )
 
-            print("Proveedor desactivado.")
+            provider = next(
+                (
+                    p
+                    for p in providers
+                    if p["name"].lower()
+                    == name.lower()
+                ),
+                None
+            )
 
-        elif option == "0":
+            if provider:
 
-            break
+                result = AIValidator.check_provider(
+                    provider
+                )
 
+                print()
+                print(result)
+
+            else:
+
+                print(
+                    "Proveedor no encontrado"
+                )
+        elif option == "7":
+
+            print()
+            print("Ejecutando SpeedTest...")
+
+            result = NetworkManager.speed_test()
+
+            if result["success"]:
+
+                print()
+                print(
+                    "DESCARGA:",
+                    result["download"],
+                    "Mbps"
+                )
+
+                print(
+                    "SUBIDA:",
+                    result["upload"],
+                    "Mbps"
+                )
+
+                print(
+                    "PING:",
+                    result["ping"],
+                    "ms"
+                )
+
+            else:
+
+                print()
+                print(
+                    "Error:",
+                    result["error"]
+                )
 
 # =========================================================
 # MAIN
@@ -464,104 +685,139 @@ def ai_hub_menu():
 
 def main():
 
-    print()
-    print("===================================")
-    print("       AVIZOR CLEANER")
-    print("===================================")
-
     info = SystemInfo.get_info()
 
-    result = HealthAnalyzer.analyze(info)
-
     print()
-    print("Equipo:", info["hostname"])
-    print("Sistema:", info["os"])
-    print("CPU:", info["cpu_usage"], "%")
-    print("RAM:", info["ram_usage"], "%")
-    print("Disco:", info["disk_usage"], "%")
-
+    print("AVIZOR CLEANER V0.2")
     print()
-    print("Health Score:", result["score"])
-    print("Estado:", result["status"])
-
-    print()
-    print("========== RED ==========")
-
-    network = NetworkManager.get_network_usage()
 
     print(
-        "Datos enviados:",
-        NetworkManager.format_bytes(
-            network["bytes_sent"]
-        )
+        "CPU:",
+        info["cpu_usage"],
+        "%"
     )
 
     print(
-        "Datos recibidos:",
-        NetworkManager.format_bytes(
-            network["bytes_received"]
-        )
+        "RAM:",
+        info["ram_usage"],
+        "%"
     )
 
     print(
-        "IP Local:",
-        NetworkManager.get_local_ip()
-    )
-
-    print(
-        "IP Pública:",
-        NetworkManager.get_public_ip()
+        "DISCO:",
+        info["disk_usage"],
+        "%"
     )
 
     print()
-    print("========== LIMPIEZA ==========")
 
     temp = Cleaner.scan_temp()
 
     print(
-        "Archivos temporales:",
-        temp["files"]
-    )
-
-    print(
-        "Espacio recuperable:",
+        "Recuperable:",
         temp["size_mb"],
         "MB"
     )
 
-    print()
-    print("========== AI HUB ==========")
+    print(
+        "IP:",
+        NetworkManager.get_public_ip()
+    )
+    google_ping = NetworkManager.ping_host(
+        "8.8.8.8"
+    )
 
-    providers = AIProviderManager.get_all()
-
-    if not providers:
-
-        print("No hay proveedores configurados")
-
-    else:
-
-        for provider in providers:
-
-            print(
-                f"{provider['name']} | "
-                f"{provider['model']}"
-            )
+    cloudflare_ping = NetworkManager.ping_host(
+        "1.1.1.1"
+    )
 
     print()
-    print("¿Abrir AI HUB?")
-    print("1 = Sí")
-    print("0 = No")
 
-    option = input("> ")
+    print(
+        "Google DNS:",
+        google_ping,
+        "ms"
+    )
 
-    if option == "1":
+    print(
+        "Cloudflare DNS:",
+        cloudflare_ping,
+        "ms"
+    )
+    google_ping = NetworkManager.ping_host(
+        "8.8.8.8"
+    )
+
+    cloudflare_ping = NetworkManager.ping_host(
+        "1.1.1.1"
+    )
+
+    print()
+
+    print(
+        "Google DNS:",
+        google_ping,
+        "ms"
+    )
+
+    print(
+        "Cloudflare DNS:",
+        cloudflare_ping,
+        "ms"
+    )
+
+    print(
+        "PING:",
+        "OK"
+        if NetworkManager.ping_google()
+        else "ERROR"
+    )
+
+    print()
+    print("1 = AI HUB")
+    print("0 = Salir")
+
+    if input("> ") == "1":
 
         ai_hub_menu()
+    @staticmethod
+    def ping_host(host="8.8.8.8"):
 
+        try:
+
+            command = (
+                ["ping", "-n", "1", host]
+                if os.name == "nt"
+                else
+                ["ping", "-c", "1", host]
+            )
+
+            start = time.time()
+
+            result = subprocess.run(
+                command,
+                capture_output=True
+            )
+
+            if result.returncode == 0:
+
+                return round(
+                    (
+                        time.time()
+                        - start
+                    ) * 1000,
+                    2
+                )
+
+            return -1
+
+        except Exception:
+
+            return -1
 
 # =========================================================
 # INICIO
 # =========================================================
 
 if __name__ == "__main__":
-    main()
+    main()     
