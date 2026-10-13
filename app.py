@@ -184,7 +184,35 @@ class HealthAnalyzer:
 
             "recommendations": recommendations
         }
+# =========================================================
+# NETWORK MANAGER
+# =========================================================
 
+class NetworkManager:
+
+    @staticmethod
+    def get_network_usage():
+
+        net = psutil.net_io_counters()
+
+        return {
+            "bytes_sent": net.bytes_sent,
+            "bytes_received": net.bytes_recv,
+            "packets_sent": net.packets_sent,
+            "packets_received": net.packets_recv
+        }
+
+    @staticmethod
+    def format_bytes(value):
+
+        for unit in ["B", "KB", "MB", "GB", "TB"]:
+
+            if value < 1024:
+                return f"{value:.2f} {unit}"
+
+            value /= 1024
+
+        return f"{value:.2f} PB"
 # =========================================================
 # MAIN
 # =========================================================
@@ -210,7 +238,24 @@ def main():
     print()
     print("Health Score:", result["score"])
     print("Estado:", result["status"])
+    print()
+    print("========== RED ==========")
 
+    network = NetworkManager.get_network_usage()
+
+    print(
+        "Datos enviados:",
+        NetworkManager.format_bytes(
+            network["bytes_sent"]
+        )
+    )
+
+    print(
+        "Datos recibidos:",
+        NetworkManager.format_bytes(
+            network["bytes_received"]
+        )
+    )
     if result["recommendations"]:
 
         print()
