@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import time
@@ -14,18 +15,97 @@ import ctypes
 from datetime import datetime
 
 # Interfaz visual con Rich
-from rich.console import Console
+from rich.console import Console, Group
 from rich.table import Table
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.text import Text
+from rich.progress_bar import ProgressBar
+from rich.align import Align
 from rich import box
 
 console = Console()
 
-CONFIG_FILE = "config.json"
-AI_PROVIDERS_FILE = "ai_providers.json"
-REPORTS_DIR = "reports"
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+GUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+ULTIMATE_PERF_GUID = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+# PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA (EmptyWorkingSet)
+PROCESS_TRIM_ACCESS = 0x0400 | 0x0100
+
+
+def _is_frozen():
+    return bool(getattr(sys, "frozen", False))
+
+
+def _dir_is_writable(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".avizor_write_test")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("1")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def resolve_app_dir():
+    """Directorio persistente junto al .exe (portable) o al script.
+    Si no se puede escribir (p. ej. Program Files), usa LocalAppData.
+    Nunca usa sys._MEIPASS: en onefile es temporal y se borra al salir.
+    """
+    if _is_frozen():
+        portable = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        portable = os.path.dirname(os.path.abspath(__file__))
+
+    if _dir_is_writable(portable):
+        return portable
+
+    fallback = os.path.join(
+        os.environ.get("LOCALAPPDATA", tempfile.gettempdir()),
+        "AvizorCleaner",
+    )
+    if _dir_is_writable(fallback):
+        return fallback
+    return tempfile.gettempdir()
+
+
+APP_DIR = resolve_app_dir()
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+AI_PROVIDERS_FILE = os.path.join(APP_DIR, "ai_providers.json")
+REPORTS_DIR = os.path.join(APP_DIR, "reports")
+
+
+def _bundle_dir():
+    return getattr(sys, "_MEIPASS", None)
+
+
+def _seed_file_from_bundle(dest_path):
+    """Copia JSON embebido en el .exe junto al ejecutable la primera vez."""
+    if os.path.isfile(dest_path):
+        return
+    bundled = _bundle_dir()
+    if not bundled:
+        return
+    src = os.path.join(bundled, os.path.basename(dest_path))
+    if os.path.isfile(src):
+        try:
+            shutil.copy2(src, dest_path)
+        except Exception:
+            pass
+
+
+def init_portable_files():
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+    except Exception:
+        pass
+    _seed_file_from_bundle(CONFIG_FILE)
+    _seed_file_from_bundle(AI_PROVIDERS_FILE)
 
 
 # =========================================================
@@ -33,21 +113,77 @@ REPORTS_DIR = "reports"
 # =========================================================
 
 def is_admin():
+    if os.name != "nt":
+        return False
     try:
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
 
+
 def request_admin_elevation():
-    if os.name == "nt" and not is_admin():
+    """Relanza con UAC. Si el usuario cancela, continúa sin admin (no bloquea)."""
+    if os.name != "nt" or is_admin():
+        return
+    try:
+        if _is_frozen():
+            executable = sys.executable
+            params = " ".join(f'"{arg}"' for arg in sys.argv[1:])
+        else:
+            executable = sys.executable
+            params = " ".join(f'"{arg}"' for arg in sys.argv)
+
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", executable, params, APP_DIR, 1
+        )
         try:
-            ret = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", sys.executable, " ".join(f'"{arg}"' for arg in sys.argv), None, 1
-            )
-            if ret > 32:
-                sys.exit(0)
-        except Exception:
-            pass
+            ret_code = int(ret)
+        except (TypeError, ValueError):
+            ret_code = 0
+        if ret_code > 32:
+            sys.exit(0)
+    except Exception:
+        pass
+
+
+def run_hidden(args, timeout=30, shell=False):
+    """Ejecuta un comando de Windows sin ventanas extra ni espera de stdin.
+    Nunca propaga excepciones: permisos, timeout o encoding no congelan la UI.
+    """
+    kwargs = {
+        "args": args,
+        "capture_output": True,
+        "timeout": timeout,
+        "shell": shell,
+        "stdin": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = CREATE_NO_WINDOW
+        kwargs["encoding"] = "oem"
+        kwargs["errors"] = "replace"
+    else:
+        kwargs["text"] = True
+
+    try:
+        res = subprocess.run(**kwargs)
+        return (
+            res.returncode,
+            (res.stdout or "").strip(),
+            (res.stderr or "").strip(),
+        )
+    except subprocess.TimeoutExpired:
+        return -1, "", "Tiempo de espera agotado."
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def require_admin():
+    if is_admin():
+        return None
+    return (
+        "Se requieren permisos de administrador. "
+        "Acepta el aviso UAC o ejecuta AvizorCleaner como administrador."
+    )
 
 
 # =========================================================
@@ -65,8 +201,13 @@ class ConfigurationManager:
 
     @staticmethod
     def save_config(config):
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4, ensure_ascii=False)
+        try:
+            os.makedirs(os.path.dirname(CONFIG_FILE) or ".", exist_ok=True)
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=4, ensure_ascii=False)
+            return True
+        except Exception:
+            return False
 
 
 class AIProviderManager:
@@ -74,14 +215,23 @@ class AIProviderManager:
     def load_providers():
         try:
             with open(AI_PROVIDERS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {"providers": []}
+            data.setdefault("providers", [])
+            return data
         except Exception:
             return {"providers": []}
 
     @staticmethod
     def save_providers(data):
-        with open(AI_PROVIDERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        try:
+            os.makedirs(os.path.dirname(AI_PROVIDERS_FILE) or ".", exist_ok=True)
+            with open(AI_PROVIDERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def add_provider(name, api_key="", endpoint="", model="auto"):
@@ -195,6 +345,8 @@ class AIValidator:
             return f"Error en respuesta: {res.status_code}"
         except Exception as e:
             return f"Error al generar diagnóstico: {e}"
+
+
 # =========================================================
 # SYSTEM & HEALTH MONITOR
 # =========================================================
@@ -223,8 +375,8 @@ class SystemInfo:
 
 class AdvancedHealthAnalyzer:
     @staticmethod
-    def calculate():
-        info = SystemInfo.get_info()
+    def calculate(info=None):
+        info = info or SystemInfo.get_info()
         cpu_score = max(0, 25 - int(info["cpu_usage"] / 4))
         ram_score = max(0, 25 - int(info["ram_usage"] / 4))
         disk_score = max(0, 20 - int(info["disk_usage"] / 5))
@@ -246,7 +398,11 @@ class Cleaner:
         removed = 0
         if not os.path.exists(folder_path):
             return 0
-        for root, _, files in os.walk(folder_path):
+        try:
+            walker = os.walk(folder_path)
+        except Exception:
+            return 0
+        for root, _, files in walker:
             for file in files:
                 try:
                     os.remove(os.path.join(root, file))
@@ -259,7 +415,11 @@ class Cleaner:
     def scan_temp():
         temp_dir = tempfile.gettempdir()
         total_size, total_files = 0, 0
-        for root, _, files in os.walk(temp_dir):
+        try:
+            walker = os.walk(temp_dir)
+        except Exception:
+            return {"files": 0, "size_mb": 0.0}
+        for root, _, files in walker:
             for file in files:
                 try:
                     p = os.path.join(root, file)
@@ -278,10 +438,11 @@ class Cleaner:
         if os.name != "nt":
             return "Solo disponible en Windows"
         try:
+            # SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND = 7
             res = ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 7)
             return "Papelera vaciada con éxito." if res == 0 else "Papelera ya vacía o no disponible."
         except Exception as e:
-            return f"Error: {e}"
+            return f"No se pudo vaciar la papelera: {e}"
 
     @staticmethod
     def clean_prefetch():
@@ -311,7 +472,11 @@ class Cleaner:
         ]
         for target in targets:
             if "Firefox" in target and os.path.exists(target):
-                for profile in os.listdir(target):
+                try:
+                    profiles = os.listdir(target)
+                except Exception:
+                    continue
+                for profile in profiles:
                     cache_dir = os.path.join(target, profile, "cache2")
                     removed += Cleaner._delete_folder_contents(cache_dir)
             else:
@@ -328,18 +493,24 @@ class Cleaner:
         exts = {".exe", ".msi", ".iso", ".zip", ".rar", ".tar", ".gz"}
         removed, freed_bytes = 0, 0
 
-        for file in os.listdir(downloads_dir):
+        try:
+            names = os.listdir(downloads_dir)
+        except Exception:
+            return 0, 0.0
+
+        for file in names:
             path = os.path.join(downloads_dir, file)
-            if os.path.isfile(path):
+            try:
+                if not os.path.isfile(path):
+                    continue
                 ext = os.path.splitext(file)[1].lower()
                 if ext in exts and os.path.getmtime(path) < cutoff:
-                    try:
-                        sz = os.path.getsize(path)
-                        os.remove(path)
-                        freed_bytes += sz
-                        removed += 1
-                    except Exception:
-                        pass
+                    sz = os.path.getsize(path)
+                    os.remove(path)
+                    freed_bytes += sz
+                    removed += 1
+            except Exception:
+                pass
         return removed, round(freed_bytes / (1024 * 1024), 2)
 
 
@@ -371,12 +542,17 @@ class WindowsDeepCleaner:
     def clean_windows_update():
         if os.name != "nt":
             return False, "Solo disponible en Windows."
-        try:
-            cmd = "dism.exe /online /cleanup-image /startcomponentcleanup /resetbase"
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            return res.returncode == 0, "Actualizaciones obsoletas eliminadas." if res.returncode == 0 else "Error al ejecutar DISM."
-        except Exception as e:
-            return False, str(e)
+        denied = require_admin()
+        if denied:
+            return False, denied
+        code, out, err = run_hidden(
+            ["dism.exe", "/online", "/cleanup-image", "/startcomponentcleanup", "/resetbase"],
+            timeout=1800,
+        )
+        if code == 0:
+            return True, "Actualizaciones obsoletas eliminadas."
+        detail = err or out or f"código {code}"
+        return False, f"DISM no pudo completar la limpieza ({detail})."
 
 
 # =========================================================
@@ -388,33 +564,48 @@ class SystemRepairManager:
     def run_sfc_scan():
         if os.name != "nt":
             return "Solo disponible en Windows."
-        try:
-            res = subprocess.run("sfc /scannow", shell=True, capture_output=True, text=True)
-            return "SFC completado exitosamente." if res.returncode == 0 else "SFC finalizado con observaciones o errores."
-        except Exception as e:
-            return str(e)
+        denied = require_admin()
+        if denied:
+            return denied
+        code, out, err = run_hidden(["sfc", "/scannow"], timeout=1800)
+        if code == 0:
+            return "SFC completado exitosamente."
+        detail = err or out or f"código {code}"
+        return f"SFC finalizado con observaciones o errores ({detail})."
 
     @staticmethod
     def run_dism_restore():
         if os.name != "nt":
             return "Solo disponible en Windows."
-        try:
-            res = subprocess.run("DISM /Online /Cleanup-Image /RestoreHealth", shell=True, capture_output=True, text=True)
-            return "Imagen de Windows reparada." if res.returncode == 0 else "Error al reparar imagen de Windows."
-        except Exception as e:
-            return str(e)
+        denied = require_admin()
+        if denied:
+            return denied
+        code, out, err = run_hidden(
+            ["DISM", "/Online", "/Cleanup-Image", "/RestoreHealth"],
+            timeout=1800,
+        )
+        if code == 0:
+            return "Imagen de Windows reparada."
+        detail = err or out or f"código {code}"
+        return f"Error al reparar imagen de Windows ({detail})."
 
     @staticmethod
     def check_smart_disks():
         if os.name != "nt":
             return []
-        try:
-            cmd = 'powershell "Get-PhysicalDisk | Select-Object FriendlyName, MediaType, HealthStatus, OperationalStatus | ConvertTo-Json"'
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            if res.returncode == 0 and res.stdout.strip():
-                data = json.loads(res.stdout)
-                return [data] if isinstance(data, dict) else data
+        cmd = (
+            "Get-PhysicalDisk | Select-Object FriendlyName, MediaType, "
+            "HealthStatus, OperationalStatus | ConvertTo-Json"
+        )
+        code, out, _err = run_hidden(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+            timeout=25,
+        )
+        if code != 0 or not out:
             return []
+        try:
+            data = json.loads(out)
+            return [data] if isinstance(data, dict) else data
         except Exception:
             return []
 
@@ -428,38 +619,57 @@ class PerformanceTweaks:
     def enable_ultimate_performance():
         if os.name != "nt":
             return False, "Solo disponible en Windows."
-        try:
-            cmd = "powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61"
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            if res.returncode == 0:
-                # Extraer GUID y activar esquema
-                guid = res.stdout.split()[3] if len(res.stdout.split()) > 3 else None
-                if guid:
-                    subprocess.run(f"powercfg /setactive {guid}", shell=True)
-                return True, "Plan de Energía 'Máximo Rendimiento' activado."
-            return False, "No se pudo desbloquear el plan de energía."
-        except Exception as e:
-            return False, str(e)
+        denied = require_admin()
+        if denied:
+            return False, denied
+        run_hidden(["powercfg", "-duplicatescheme", ULTIMATE_PERF_GUID], timeout=20)
+        code, out, err = run_hidden(["powercfg", "/list"], timeout=20)
+        guid = None
+        if code == 0 and out:
+            for line in out.splitlines():
+                if ULTIMATE_PERF_GUID.lower() in line.lower() or "ultimate" in line.lower() or "máximo rendimiento" in line.lower() or "maximo rendimiento" in line.lower():
+                    found = GUID_RE.search(line)
+                    if found:
+                        guid = found.group(0)
+                        break
+            if not guid:
+                found = GUID_RE.search(out)
+                if found:
+                    guid = found.group(0)
+        if not guid:
+            guid = ULTIMATE_PERF_GUID
+        set_code, _o, set_err = run_hidden(["powercfg", "/setactive", guid], timeout=15)
+        if set_code == 0:
+            return True, "Plan de Energía 'Máximo Rendimiento' activado."
+        return False, set_err or err or "No se pudo desbloquear el plan de energía."
 
     @staticmethod
     def run_trim_ssd():
         if os.name != "nt":
             return False, "Solo disponible en Windows."
-        try:
-            res = subprocess.run("defrag C: /O", shell=True, capture_output=True)
-            return res.returncode == 0, "Optimización TRIM completada en el disco C:"
-        except Exception as e:
-            return False, str(e)
+        denied = require_admin()
+        if denied:
+            return False, denied
+        code, out, err = run_hidden(["defrag", "C:", "/O"], timeout=600)
+        if code == 0:
+            return True, "Optimización TRIM completada en el disco C:"
+        detail = err or out or f"código {code}"
+        return False, f"No se pudo optimizar el disco ({detail})."
 
     @staticmethod
     def optimize_tcp_stack():
         if os.name != "nt":
             return False, "Solo disponible en Windows."
-        try:
-            subprocess.run("netsh int tcp set global autotuninglevel=normal", shell=True, capture_output=True)
+        denied = require_admin()
+        if denied:
+            return False, denied
+        code, out, err = run_hidden(
+            ["netsh", "int", "tcp", "set", "global", "autotuninglevel=normal"],
+            timeout=20,
+        )
+        if code == 0:
             return True, "Parámetros TCP Auto-Tuning configurados en modo normal."
-        except Exception as e:
-            return False, str(e)
+        return False, err or out or "No se pudo ajustar la pila TCP."
 
 
 # =========================================================
@@ -471,14 +681,20 @@ class PrivacyAndUninstallManager:
     def disable_telemetry():
         if os.name != "nt":
             return False, "Solo disponible en Windows."
-        try:
-            services = ["DiagTrack", "dmwappushservice"]
-            for s in services:
-                subprocess.run(f"sc stop {s}", shell=True, capture_output=True)
-                subprocess.run(f"sc config {s} start=disabled", shell=True, capture_output=True)
-            return True, "Servicios de telemetría y diagnóstico desactivados."
-        except Exception as e:
-            return False, str(e)
+        denied = require_admin()
+        if denied:
+            return False, denied
+        services = ["DiagTrack", "dmwappushservice"]
+        failed = []
+        for s in services:
+            run_hidden(["sc", "stop", s], timeout=15)
+            # sc exige espacio tras '=' : start= disabled
+            code, _out, err = run_hidden(["sc", "config", s, "start=", "disabled"], timeout=15)
+            if code != 0:
+                failed.append(f"{s}: {err or code}")
+        if failed:
+            return False, "No se pudieron desactivar todos los servicios: " + "; ".join(failed)
+        return True, "Servicios de telemetría y diagnóstico desactivados."
 
     @staticmethod
     def get_installed_apps():
@@ -491,19 +707,24 @@ class PrivacyAndUninstallManager:
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
             (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall")
         ]
+        access = winreg.KEY_READ
         for root, p in paths:
             try:
-                with winreg.OpenKey(root, p) as key:
+                with winreg.OpenKey(root, p, 0, access) as key:
                     for i in range(winreg.QueryInfoKey(key)[0]):
                         try:
                             sub_name = winreg.EnumKey(key, i)
-                            with winreg.OpenKey(key, sub_name) as sub_key:
+                            with winreg.OpenKey(key, sub_name, 0, access) as sub_key:
                                 display_name, _ = winreg.QueryValueEx(sub_key, "DisplayName")
                                 uninstall_str, _ = winreg.QueryValueEx(sub_key, "UninstallString")
                                 if display_name and uninstall_str:
                                     installed.append({"name": display_name, "cmd": uninstall_str})
+                        except OSError:
+                            continue
                         except Exception:
                             continue
+            except OSError:
+                continue
             except Exception:
                 continue
         unique = {app["name"]: app for app in installed}
@@ -512,7 +733,10 @@ class PrivacyAndUninstallManager:
     @staticmethod
     def uninstall_app(cmd):
         try:
-            subprocess.Popen(cmd, shell=True)
+            kwargs = {"shell": True, "stdin": subprocess.DEVNULL}
+            if os.name == "nt":
+                kwargs["creationflags"] = CREATE_NO_WINDOW
+            subprocess.Popen(cmd, **kwargs)
             return True, "Desinstalador iniciado."
         except Exception as e:
             return False, str(e)
@@ -531,10 +755,15 @@ class StartupManager:
         ]
         for root_key, subkey, scope in keys:
             try:
-                with winreg.OpenKey(root_key, subkey) as key:
+                with winreg.OpenKey(root_key, subkey, 0, winreg.KEY_READ) as key:
                     for i in range(winreg.QueryInfoKey(key)[1]):
-                        name, val, _ = winreg.EnumValue(key, i)
-                        startup_apps.append({"name": name, "command": val, "scope": scope})
+                        try:
+                            name, val, _ = winreg.EnumValue(key, i)
+                            startup_apps.append({"name": name, "command": str(val), "scope": scope})
+                        except OSError:
+                            continue
+            except OSError:
+                pass
             except Exception:
                 pass
         return startup_apps
@@ -545,10 +774,14 @@ class StartupManager:
             return False, "Solo disponible en Windows."
         import winreg
         root_key = winreg.HKEY_CURRENT_USER if scope == "Usuario Actual" else winreg.HKEY_LOCAL_MACHINE
+        if scope != "Usuario Actual" and not is_admin():
+            return False, require_admin()
         try:
             with winreg.OpenKey(root_key, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE) as key:
                 winreg.DeleteValue(key, name)
             return True, f"'{name}' eliminado del arranque."
+        except OSError as e:
+            return False, f"No se pudo modificar el registro: {e}"
         except Exception as e:
             return False, str(e)
 
@@ -558,31 +791,47 @@ class StartupManager:
 # =========================================================
 
 class NetworkManager:
+    _public_ip_cache = {"value": None, "ts": 0.0}
+
     @staticmethod
     def get_local_ip():
+        s = None
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(2)
             s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
+            return s.getsockname()[0]
         except Exception:
             return "No disponible"
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
 
     @staticmethod
     def get_public_ip():
+        now = time.time()
+        cached = NetworkManager._public_ip_cache
+        ttl = 30 if cached.get("value") == "No disponible" else 120
+        if cached.get("value") is not None and now - cached["ts"] < ttl:
+            return cached["value"]
         try:
-            return requests.get("https://api.ipify.org", timeout=4).text.strip()
+            ip = requests.get("https://api.ipify.org", timeout=2).text.strip()
+            value = ip or "No disponible"
         except Exception:
-            return "No disponible"
+            value = "No disponible"
+        NetworkManager._public_ip_cache = {"value": value, "ts": now}
+        return value
 
     @staticmethod
     def ping_host(host="8.8.8.8"):
         try:
-            cmd = ["ping", "-n", "1", host] if os.name == "nt" else ["ping", "-c", "1", host]
+            cmd = ["ping", "-n", "1", "-w", "2000", host] if os.name == "nt" else ["ping", "-c", "1", host]
             start = time.time()
-            res = subprocess.run(cmd, capture_output=True)
-            if res.returncode == 0:
+            code, _out, _err = run_hidden(cmd, timeout=6)
+            if code == 0:
                 return round((time.time() - start) * 1000, 2)
             return -1
         except Exception:
@@ -606,7 +855,8 @@ class NetworkManager:
     def flush_dns():
         try:
             cmd = ["ipconfig", "/flushdns"] if os.name == "nt" else ["resolvectl", "flush-caches"]
-            return subprocess.run(cmd, capture_output=True).returncode == 0
+            code, _out, _err = run_hidden(cmd, timeout=15)
+            return code == 0
         except Exception:
             return False
 
@@ -614,15 +864,22 @@ class NetworkManager:
     def set_fast_dns(interface_name="Wi-Fi", primary="1.1.1.1", secondary="1.0.0.1"):
         if os.name != "nt":
             return False, "Solo disponible en Windows."
-        try:
-            cmd1 = f'netsh interface ip set dns name="{interface_name}" static {primary}'
-            cmd2 = f'netsh interface ip add dns name="{interface_name}" {secondary} index=2'
-            subprocess.run(cmd1, shell=True, capture_output=True)
-            subprocess.run(cmd2, shell=True, capture_output=True)
-            subprocess.run("ipconfig /flushdns", shell=True, capture_output=True)
+        denied = require_admin()
+        if denied:
+            return False, denied
+        iface = f'name={interface_name}'
+        code1, _o1, e1 = run_hidden(
+            ["netsh", "interface", "ip", "set", "dns", iface, "static", primary],
+            timeout=20,
+        )
+        run_hidden(
+            ["netsh", "interface", "ip", "add", "dns", iface, secondary, "index=2"],
+            timeout=20,
+        )
+        run_hidden(["ipconfig", "/flushdns"], timeout=15)
+        if code1 == 0:
             return True, f"DNS ajustados a {primary} y {secondary}."
-        except Exception as e:
-            return False, str(e)
+        return False, e1 or "No se pudo cambiar el DNS. Comprueba el nombre del adaptador."
 
 
 class ProcessManager:
@@ -632,7 +889,7 @@ class ProcessManager:
         for proc in psutil.process_iter(["pid", "name", "cpu_percent"]):
             try:
                 procs.append(proc.info)
-            except Exception:
+            except (psutil.Error, Exception):
                 pass
         procs.sort(key=lambda x: x["cpu_percent"] or 0, reverse=True)
         return procs[:limit]
@@ -650,7 +907,7 @@ class ProcessManager:
                     "memory_percent": round(info["memory_percent"] or 0, 2),
                     "memory_mb": mem_mb
                 })
-            except Exception:
+            except (psutil.Error, Exception):
                 pass
         procs.sort(key=lambda x: x["memory_percent"], reverse=True)
         return procs[:limit]
@@ -658,27 +915,51 @@ class ProcessManager:
     @staticmethod
     def optimize_ram():
         freed = 0
-        if os.name == "nt":
-            for proc in psutil.process_iter(["pid"]):
-                try:
-                    h = ctypes.windll.kernel32.OpenProcess(0x001F0FFF, False, proc.info["pid"])
-                    if h:
-                        ctypes.windll.psapi.EmptyWorkingSet(h)
-                        ctypes.windll.kernel32.CloseHandle(h)
-                        freed += 1
-                except Exception:
+        if os.name != "nt":
+            return freed
+        try:
+            open_process = ctypes.windll.kernel32.OpenProcess
+            close_handle = ctypes.windll.kernel32.CloseHandle
+            empty_ws = ctypes.windll.psapi.EmptyWorkingSet
+            open_process.restype = ctypes.c_void_p
+            close_handle.argtypes = [ctypes.c_void_p]
+            empty_ws.argtypes = [ctypes.c_void_p]
+        except Exception:
+            return 0
+
+        for proc in psutil.process_iter(["pid"]):
+            handle = None
+            try:
+                pid = proc.info["pid"]
+                if not pid or pid == 0:
                     continue
+                handle = open_process(PROCESS_TRIM_ACCESS, False, pid)
+                if handle:
+                    empty_ws(handle)
+                    freed += 1
+            except Exception:
+                continue
+            finally:
+                if handle:
+                    try:
+                        close_handle(handle)
+                    except Exception:
+                        pass
         return freed
 
 
 class ReportGenerator:
     @staticmethod
     def generate_full_report():
-        os.makedirs(REPORTS_DIR, exist_ok=True)
+        try:
+            os.makedirs(REPORTS_DIR, exist_ok=True)
+        except Exception as e:
+            raise RuntimeError(f"No se pudo crear la carpeta de informes: {e}") from e
+        system_info = SystemInfo.get_info()
         report_data = {
             "generated_at": datetime.now().isoformat(),
-            "system": SystemInfo.get_info(),
-            "health": AdvancedHealthAnalyzer.calculate(),
+            "system": system_info,
+            "health": AdvancedHealthAnalyzer.calculate(system_info),
             "temp_scan": Cleaner.scan_temp(),
             "network": {
                 "local_ip": NetworkManager.get_local_ip(),
@@ -954,44 +1235,156 @@ def ai_hub_menu():
 
 
 # =========================================================
+# DASHBOARD UI (menú principal)
+# =========================================================
+
+def _usage_color(percent):
+    pct = float(percent or 0)
+    if pct < 60:
+        return "green"
+    if pct <= 80:
+        return "yellow"
+    return "red"
+
+
+def _usage_bar(percent, width=24):
+    pct = max(0.0, min(100.0, float(percent or 0)))
+    color = _usage_color(pct)
+    return ProgressBar(
+        total=100,
+        completed=pct,
+        width=width,
+        complete_style=color,
+        finished_style=color,
+        pulse_style="cyan",
+    )
+
+
+BANNER_ASCII = r"""
+    _ __   __ _____ _____  ___    ___
+   / \\ \ / /|_ _/ _  / _ \  | _ \ 
+  / _ \\ V /  | || (_) |   /  |   /
+ /_/ \_\\_/  |___|\___/|_|_\  |_|_\
+"""
+
+
+def render_main_dashboard(info, health):
+    admin_txt = (
+        "[bold green]ADMIN[/bold green]"
+        if info["is_admin"]
+        else "[bold yellow]USUARIO[/bold yellow]"
+    )
+    banner = Text(BANNER_ASCII, style="bold cyan", justify="center")
+    subtitle = Text.from_markup(
+        f"[bold white]CLEANER PRO[/bold white]  [dim]v1.2[/dim]   {admin_txt}",
+        justify="center",
+    )
+
+    metrics = Table(box=None, expand=True, pad_edge=False, show_header=False)
+    metrics.add_column("label", style="bold cyan", width=8)
+    metrics.add_column("bar", ratio=1)
+    metrics.add_column("value", justify="right", width=22)
+
+    metrics.add_row(
+        "CPU",
+        _usage_bar(info["cpu_usage"]),
+        f"[{_usage_color(info['cpu_usage'])}]{info['cpu_usage']:>5.1f}%[/]",
+    )
+    metrics.add_row(
+        "RAM",
+        _usage_bar(info["ram_usage"]),
+        f"[{_usage_color(info['ram_usage'])}]{info['ram_usage']:>5.1f}%[/]  "
+        f"[dim]{info['ram_free_gb']} GB libres[/dim]",
+    )
+    metrics.add_row(
+        "DISCO",
+        _usage_bar(info["disk_usage"]),
+        f"[{_usage_color(info['disk_usage'])}]{info['disk_usage']:>5.1f}%[/]  "
+        f"[dim]{info['disk_free_gb']} GB libres[/dim]",
+    )
+
+    meta = Table(box=None, expand=True, show_header=False)
+    meta.add_column(justify="left")
+    meta.add_column(justify="right")
+    meta.add_row(
+        f"[white]Host[/white] [cyan]{info['hostname']}[/cyan]  [dim]{info['os']}[/dim]",
+        f"[white]Salud[/white] [{health['color']}]{health['score']}/100 {health['status']}[/]",
+    )
+    meta.add_row(
+        f"[white]IP pública[/white] [cyan]{NetworkManager.get_public_ip()}[/cyan]",
+        f"[dim]{info['timestamp']}[/dim]",
+    )
+
+    header = Panel(
+        Group(Align.center(banner), Align.center(subtitle), Text(""), meta, Text(""), metrics),
+        title="[bold cyan]◆ AVIZOR[/bold cyan]",
+        subtitle="[dim cyan]dashboard de mantenimiento Windows[/dim cyan]",
+        border_style="cyan",
+        box=box.ROUNDED,
+        style="on #0b1220",
+        padding=(0, 1),
+    )
+
+    items = [
+        ("1", "◆", "Limpieza", "TEMP, navegadores y Windows Update"),
+        ("2", "⚡", "Rendimiento", "SSD TRIM, SFC y hardware"),
+        ("3", "▣", "Programas", "Desinstalador e inicio"),
+        ("4", "▦", "Memoria RAM", "Compactar procesos"),
+        ("5", "◈", "Red y DNS", "Latencia y Cloudflare"),
+        ("6", "✦", "AI Hub", "Autovinculación y diagnóstico LLM"),
+        ("7", "▤", "Informe JSON", "Exportar reporte del sistema"),
+    ]
+
+    menu = Table(
+        box=box.ROUNDED,
+        expand=True,
+        show_header=True,
+        header_style="bold cyan",
+        border_style="blue",
+        style="on #0b1220",
+        pad_edge=True,
+    )
+    menu.add_column("Opción", width=10, justify="center")
+    menu.add_column("Módulo", ratio=1)
+    menu.add_column("Opción", width=10, justify="center")
+    menu.add_column("Módulo", ratio=1)
+
+    for i in range(0, 6, 2):
+        a, b = items[i], items[i + 1]
+        menu.add_row(
+            f"[bold yellow][{a[0]}][/bold yellow] {a[1]}",
+            f"[bold white]{a[2]}[/bold white]\n[dim]{a[3]}[/dim]",
+            f"[bold yellow][{b[0]}][/bold yellow] {b[1]}",
+            f"[bold white]{b[2]}[/bold white]\n[dim]{b[3]}[/dim]",
+        )
+    last = items[6]
+    menu.add_row(
+        f"[bold yellow][{last[0]}][/bold yellow] {last[1]}",
+        f"[bold white]{last[2]}[/bold white]\n[dim]{last[3]}[/dim]",
+        "[bold yellow][0][/bold yellow] ✕",
+        "[bold white]Salir[/bold white]\n[dim]Cerrar AvizorCleaner[/dim]",
+    )
+
+    console.print(header)
+    console.print()
+    console.print(menu)
+
+
+# =========================================================
 # MAIN APP
 # =========================================================
 
 def main():
+    init_portable_files()
     request_admin_elevation()
 
     while True:
         console.clear()
         info = SystemInfo.get_info()
-        health = AdvancedHealthAnalyzer.calculate()
-        admin_txt = "[bold green][ADMIN][/bold green]" if info["is_admin"] else "[yellow][USUARIO][/yellow]"
+        health = AdvancedHealthAnalyzer.calculate(info)
+        render_main_dashboard(info, health)
 
-        header_table = Table(show_header=False, box=box.ROUNDED, expand=True)
-        header_table.add_column("Col1", style="bold white")
-        header_table.add_column("Col2", style="bold cyan")
-
-        header_table.add_row(f"AVIZOR CLEANER PRO v1.2 {admin_txt}", f"Host: {info['hostname']} ({info['os']})")
-        header_table.add_row(
-            f"Salud: [{health['color']}]{health['score']}/100 ({health['status']})[/{health['color']}]",
-            f"CPU: {info['cpu_usage']}% | RAM: {info['ram_usage']}% ({info['ram_free_gb']} GB libres)"
-        )
-        header_table.add_row(
-            f"Disco: {info['disk_usage']}% ({info['disk_free_gb']} GB libres)",
-            f"IP Pública: {NetworkManager.get_public_ip()}"
-        )
-        console.print(header_table)
-
-        console.print("\n[bold]Panel de Control:[/bold]")
-        console.print("[1] Limpiador del Sistema, Navegadores y Windows Update")
-        console.print("[2] Rendimiento, SSD TRIM, Reparación SFC & Hardware")
-        console.print("[3] Gestión de Programas, Desinstalador e Inicio")
-        console.print("[4] Optimización de Memoria RAM & Procesos")
-        console.print("[5] Conectividad, DNS Rápidos & Red")
-        console.print("[6] AI Hub (Autovinculación & Diagnóstico LLM)")
-        console.print("[7] Exportar Informe JSON")
-        console.print("[0] Salir\n")
-
-        opt = Prompt.ask("[bold yellow]Seleccione una opción[/bold yellow]", default="0")
+        opt = Prompt.ask("[bold cyan]  › Seleccione una opción[/bold cyan]", default="0")
 
         if opt == "1":
             cleaner_menu()
@@ -1012,9 +1405,12 @@ def main():
         elif opt == "6":
             ai_hub_menu()
         elif opt == "7":
-            with console.status("[bold cyan]Exportando informe..."):
-                p = ReportGenerator.generate_full_report()
-            console.print(f"\n[green]Reporte generado en:[/green] {p}")
+            try:
+                with console.status("[bold cyan]Exportando informe..."):
+                    p = ReportGenerator.generate_full_report()
+                console.print(f"\n[green]Reporte generado en:[/green] {p}")
+            except Exception as e:
+                console.print(f"\n[red]No se pudo generar el reporte:[/red] {e}")
             Prompt.ask("\nPresione Enter para continuar")
         elif opt == "0":
             console.print("\n[bold cyan]Cerrando AvizorCleaner.[/bold cyan]")
@@ -1022,4 +1418,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[bold cyan]Cerrando AvizorCleaner.[/bold cyan]")
+        sys.exit(0)
+    except Exception as e:
+        console.print(f"\n[red]Error inesperado:[/red] {e}")
+        try:
+            Prompt.ask("\nPresione Enter para salir")
+        except Exception:
+            time.sleep(2)
+        sys.exit(1)
