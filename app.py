@@ -1,3 +1,20 @@
+"""
+============================================================
+ AVIZOR CLEANER PRO v2.0 - GUI EDITION
+============================================================
+Aplicación de escritorio estilo Windows para mantenimiento.
+
+INSTALACIÓN (una sola vez):
+    pip install customtkinter psutil requests speedtest-cli
+
+EJECUCIÓN:
+    python avizor_cleaner.py
+
+Requiere Windows 10/11 para funcionalidad completa.
+Algunas acciones (SFC, DISM, telemetría, RAM real) requieren
+ejecutar como Administrador. Si no lo estás, la app te lo dirá.
+"""
+
 import os
 import re
 import sys
@@ -7,111 +24,46 @@ import socket
 import platform
 import tempfile
 import subprocess
-import requests
-import psutil
-import speedtest
-import shutil
+import threading
 import ctypes
+import shutil
 from datetime import datetime
+from tkinter import simpledialog, messagebox
 
-# Interfaz visual con Rich
-from rich.console import Console, Group
-from rich.table import Table
-from rich.panel import Panel
-from rich.prompt import Prompt
-from rich.text import Text
-from rich.progress_bar import ProgressBar
-from rich.align import Align
-from rich import box
+import psutil
 
-console = Console()
+try:
+    import customtkinter as ctk
+except ImportError:
+    print("Falta 'customtkinter'. Instala con:")
+    print("    pip install customtkinter")
+    sys.exit(1)
 
-CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-GUID_RE = re.compile(
+try:
+    import requests
+except ImportError:
+    requests = None
+
+
+# =========================================================
+# CONSTANTES
+# =========================================================
+CREATE_NO_WINDOW      = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+GUID_RE               = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
-ULTIMATE_PERF_GUID = "e9a42b02-d5df-448d-aa00-03f14749eb61"
-# PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA (EmptyWorkingSet)
-PROCESS_TRIM_ACCESS = 0x0400 | 0x0100
-
-
-def _is_frozen():
-    return bool(getattr(sys, "frozen", False))
-
-
-def _dir_is_writable(path):
-    try:
-        os.makedirs(path, exist_ok=True)
-        probe = os.path.join(path, ".avizor_write_test")
-        with open(probe, "w", encoding="utf-8") as f:
-            f.write("1")
-        os.remove(probe)
-        return True
-    except Exception:
-        return False
-
-
-def resolve_app_dir():
-    """Directorio persistente junto al .exe (portable) o al script.
-    Si no se puede escribir (p. ej. Program Files), usa LocalAppData.
-    Nunca usa sys._MEIPASS: en onefile es temporal y se borra al salir.
-    """
-    if _is_frozen():
-        portable = os.path.dirname(os.path.abspath(sys.executable))
-    else:
-        portable = os.path.dirname(os.path.abspath(__file__))
-
-    if _dir_is_writable(portable):
-        return portable
-
-    fallback = os.path.join(
-        os.environ.get("LOCALAPPDATA", tempfile.gettempdir()),
-        "AvizorCleaner",
-    )
-    if _dir_is_writable(fallback):
-        return fallback
-    return tempfile.gettempdir()
-
-
-APP_DIR = resolve_app_dir()
-CONFIG_FILE = os.path.join(APP_DIR, "config.json")
-AI_PROVIDERS_FILE = os.path.join(APP_DIR, "ai_providers.json")
-REPORTS_DIR = os.path.join(APP_DIR, "reports")
-
-
-def _bundle_dir():
-    return getattr(sys, "_MEIPASS", None)
-
-
-def _seed_file_from_bundle(dest_path):
-    """Copia JSON embebido en el .exe junto al ejecutable la primera vez."""
-    if os.path.isfile(dest_path):
-        return
-    bundled = _bundle_dir()
-    if not bundled:
-        return
-    src = os.path.join(bundled, os.path.basename(dest_path))
-    if os.path.isfile(src):
-        try:
-            shutil.copy2(src, dest_path)
-        except Exception:
-            pass
-
-
-def init_portable_files():
-    try:
-        os.makedirs(APP_DIR, exist_ok=True)
-        os.makedirs(REPORTS_DIR, exist_ok=True)
-    except Exception:
-        pass
-    _seed_file_from_bundle(CONFIG_FILE)
-    _seed_file_from_bundle(AI_PROVIDERS_FILE)
+ULTIMATE_PERF_GUID    = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+PROCESS_TRIM_ACCESS   = 0x0400 | 0x0100
+SE_PRIVILEGE_ENABLED  = 0x00000002
+TOKEN_ADJUST_PRIVILEGES = 0x0020
+TOKEN_QUERY           = 0x0008
+SYSTEM_MEMORY_LIST_INFO   = 80
+MEMORY_PURGE_STANDBY_LIST = 4
 
 
 # =========================================================
-# AUTO-ELEVACIÓN A ADMINISTRADOR (UAC)
+# UTILIDADES DEL SISTEMA
 # =========================================================
-
 def is_admin():
     if os.name != "nt":
         return False
@@ -121,41 +73,35 @@ def is_admin():
         return False
 
 
-def request_admin_elevation():
-    """Relanza con UAC. Si el usuario cancela, continúa sin admin (no bloquea)."""
-    if os.name != "nt" or is_admin():
-        return
+def resolve_app_dir():
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
     try:
-        if _is_frozen():
-            executable = sys.executable
-            params = " ".join(f'"{arg}"' for arg in sys.argv[1:])
-        else:
-            executable = sys.executable
-            params = " ".join(f'"{arg}"' for arg in sys.argv)
-
-        ret = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", executable, params, APP_DIR, 1
-        )
-        try:
-            ret_code = int(ret)
-        except (TypeError, ValueError):
-            ret_code = 0
-        if ret_code > 32:
-            sys.exit(0)
+        os.makedirs(base, exist_ok=True)
+        probe = os.path.join(base, ".avizor_probe")
+        with open(probe, "w") as f:
+            f.write("1")
+        os.remove(probe)
+        return base
     except Exception:
-        pass
+        fallback = os.path.join(
+            os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "AvizorCleaner"
+        )
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+
+APP_DIR      = resolve_app_dir()
+REPORTS_DIR  = os.path.join(APP_DIR, "reports")
+os.makedirs(REPORTS_DIR, exist_ok=True)
 
 
 def run_hidden(args, timeout=30, shell=False):
-    """Ejecuta un comando de Windows sin ventanas extra ni espera de stdin.
-    Nunca propaga excepciones: permisos, timeout o encoding no congelan la UI.
-    """
     kwargs = {
-        "args": args,
-        "capture_output": True,
-        "timeout": timeout,
-        "shell": shell,
-        "stdin": subprocess.DEVNULL,
+        "args": args, "capture_output": True, "timeout": timeout,
+        "shell": shell, "stdin": subprocess.DEVNULL,
     }
     if os.name == "nt":
         kwargs["creationflags"] = CREATE_NO_WINDOW
@@ -163,286 +109,101 @@ def run_hidden(args, timeout=30, shell=False):
         kwargs["errors"] = "replace"
     else:
         kwargs["text"] = True
-
     try:
         res = subprocess.run(**kwargs)
-        return (
-            res.returncode,
-            (res.stdout or "").strip(),
-            (res.stderr or "").strip(),
-        )
+        return res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip()
     except subprocess.TimeoutExpired:
         return -1, "", "Tiempo de espera agotado."
     except Exception as e:
         return -1, "", str(e)
 
 
-def require_admin():
-    if is_admin():
-        return None
-    return (
-        "Se requieren permisos de administrador. "
-        "Acepta el aviso UAC o ejecuta AvizorCleaner como administrador."
-    )
-
-
 # =========================================================
-# CONFIGURATION & AI PROVIDERS
+# INFO DEL SISTEMA & SALUD
 # =========================================================
-
-class ConfigurationManager:
-    @staticmethod
-    def load_config():
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-
-    @staticmethod
-    def save_config(config):
-        try:
-            os.makedirs(os.path.dirname(CONFIG_FILE) or ".", exist_ok=True)
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=4, ensure_ascii=False)
-            return True
-        except Exception:
-            return False
-
-
-class AIProviderManager:
-    @staticmethod
-    def load_providers():
-        try:
-            with open(AI_PROVIDERS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                return {"providers": []}
-            data.setdefault("providers", [])
-            return data
-        except Exception:
-            return {"providers": []}
-
-    @staticmethod
-    def save_providers(data):
-        try:
-            os.makedirs(os.path.dirname(AI_PROVIDERS_FILE) or ".", exist_ok=True)
-            with open(AI_PROVIDERS_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
-            return True
-        except Exception:
-            return False
-
-    @staticmethod
-    def add_provider(name, api_key="", endpoint="", model="auto"):
-        data = AIProviderManager.load_providers()
-        existing = next((p for p in data["providers"] if p["name"].lower() == name.lower()), None)
-        if existing:
-            existing["api_key"] = api_key
-            existing["endpoint"] = endpoint
-            existing["model"] = model
-        else:
-            data["providers"].append({
-                "name": name,
-                "api_key": api_key,
-                "endpoint": endpoint,
-                "model": model,
-                "detected_model": "",
-                "enabled": True,
-                "status": "configured"
-            })
-        AIProviderManager.save_providers(data)
-
-    @staticmethod
-    def remove_provider(name):
-        data = AIProviderManager.load_providers()
-        data["providers"] = [p for p in data["providers"] if p["name"].lower() != name.lower()]
-        AIProviderManager.save_providers(data)
-
-    @staticmethod
-    def save_detected_model(provider_name, model):
-        data = AIProviderManager.load_providers()
-        for provider in data.get("providers", []):
-            if provider["name"].lower() == provider_name.lower():
-                provider["detected_model"] = model
-        AIProviderManager.save_providers(data)
-
-    @staticmethod
-    def get_all():
-        return AIProviderManager.load_providers().get("providers", [])
-
-    @staticmethod
-    def get_active_provider():
-        for p in AIProviderManager.get_all():
-            if p.get("enabled") and p.get("api_key"):
-                return p
-        return None
-
-
-class AIValidator:
-    @staticmethod
-    def auto_detect_and_bind(provider_name, api_key):
-        if not api_key:
-            return False, "La API Key está vacía."
-
-        url_models = "https://generativelanguage.googleapis.com/v1beta/models"
-        try:
-            res = requests.get(url_models, params={"key": api_key}, timeout=10)
-            if res.status_code == 400:
-                return False, "API Key inválida (Error 400)."
-            if res.status_code == 403:
-                return False, "Permisos insuficientes o cuota bloqueada (Error 403)."
-            if res.status_code != 200:
-                return False, f"Error del servidor ({res.status_code})."
-
-            data = res.json()
-            valid_models = [
-                m["name"].replace("models/", "")
-                for m in data.get("models", [])
-                if "generateContent" in m.get("supportedGenerationMethods", [])
-            ]
-
-            if not valid_models:
-                return False, "No se encontraron modelos de generación de texto disponibles."
-
-            selected_model = next((m for m in valid_models if "flash" in m.lower()), valid_models[0])
-
-            url_test = f"https://generativelanguage.googleapis.com/v1beta/models/{selected_model}:generateContent"
-            payload = {"contents": [{"parts": [{"text": "ping"}]}]}
-            test_res = requests.post(url_test, params={"key": api_key}, json=payload, timeout=10)
-
-            if test_res.status_code == 200:
-                AIProviderManager.save_detected_model(provider_name, selected_model)
-                return True, selected_model
-            else:
-                return False, f"El modelo {selected_model} devolvió status {test_res.status_code}."
-
-        except requests.exceptions.Timeout:
-            return False, "Tiempo de espera agotado al conectar con Google."
-        except Exception as e:
-            return False, f"Error de conexión: {str(e)}"
-
-    @staticmethod
-    def diagnose_system(system_summary_text):
-        provider = AIProviderManager.get_active_provider()
-        if not provider:
-            return "No hay ningún proveedor de IA activo con API Key configurada."
-
-        model = provider.get("detected_model") or provider.get("model") or "gemini-1.5-flash"
-        api_key = provider.get("api_key")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-
-        prompt = (
-            "Eres el motor de diagnóstico de AvizorCleaner. Analiza las métricas y entrega un dictamen en "
-            f"3 puntos concisos: estado general, cuello de botella detectado y 2 recomendaciones:\n\n{system_summary_text}"
-        )
-
-        try:
-            payload = {"contents": [{"parts": [{"text": prompt}]}]}
-            res = requests.post(url, params={"key": api_key}, json=payload, timeout=15)
-            if res.status_code == 200:
-                return res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            return f"Error en respuesta: {res.status_code}"
-        except Exception as e:
-            return f"Error al generar diagnóstico: {e}"
-
-
-# =========================================================
-# SYSTEM & HEALTH MONITOR
-# =========================================================
-
 class SystemInfo:
     @staticmethod
     def get_info():
-        vm = psutil.virtual_memory()
+        vm   = psutil.virtual_memory()
         disk = psutil.disk_usage(os.path.abspath(os.sep))
         return {
-            "hostname": platform.node(),
-            "processor": platform.processor(),
-            "os": f"{platform.system()} {platform.release()}",
-            "cpu_usage": psutil.cpu_percent(interval=0.3),
-            "cpu_cores": psutil.cpu_count(logical=True),
-            "ram_usage": vm.percent,
+            "hostname":     platform.node(),
+            "os":           f"{platform.system()} {platform.release()}",
+            "cpu_usage":    psutil.cpu_percent(interval=0.2),
+            "cpu_cores":    psutil.cpu_count(logical=True),
+            "ram_usage":    vm.percent,
             "ram_total_gb": round(vm.total / (1024**3), 2),
-            "ram_free_gb": round(vm.available / (1024**3), 2),
-            "disk_usage": disk.percent,
-            "disk_total_gb": round(disk.total / (1024**3), 2),
+            "ram_free_gb":  round(vm.available / (1024**3), 2),
+            "disk_usage":   disk.percent,
+            "disk_total_gb":round(disk.total / (1024**3), 2),
             "disk_free_gb": round(disk.free / (1024**3), 2),
-            "is_admin": is_admin(),
-            "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+            "is_admin":     is_admin(),
+            "timestamp":    datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         }
 
 
-class AdvancedHealthAnalyzer:
+class HealthAnalyzer:
     @staticmethod
-    def calculate(info=None):
-        info = info or SystemInfo.get_info()
-        cpu_score = max(0, 25 - int(info["cpu_usage"] / 4))
-        ram_score = max(0, 25 - int(info["ram_usage"] / 4))
+    def calculate(info):
+        cpu_score  = max(0, 25 - int(info["cpu_usage"] / 4))
+        ram_score  = max(0, 25 - int(info["ram_usage"] / 4))
         disk_score = max(0, 20 - int(info["disk_usage"] / 5))
-        total = cpu_score + ram_score + disk_score
-        final_score = int((total / 70) * 100)
-
-        color = "green" if final_score > 80 else ("yellow" if final_score > 60 else "red")
-        status = "Excelente" if final_score > 80 else ("Bueno" if final_score > 60 else "Atención requerida")
-        return {"score": final_score, "status": status, "color": color}
+        score = int(((cpu_score + ram_score + disk_score) / 70) * 100)
+        if score > 80:
+            return {"score": score, "status": "Excelente", "color": "#22c55e"}
+        if score > 60:
+            return {"score": score, "status": "Bueno", "color": "#f59e0b"}
+        return {"score": score, "status": "Atención requerida", "color": "#ef4444"}
 
 
 # =========================================================
-# LIMPIEZA BÁSICA Y PROFUNDA DE WINDOWS
+# LIMPIEZA
 # =========================================================
-
 class Cleaner:
     @staticmethod
     def _delete_folder_contents(folder_path):
-        removed = 0
         if not os.path.exists(folder_path):
             return 0
+        removed = 0
         try:
             walker = os.walk(folder_path)
         except Exception:
             return 0
         for root, _, files in walker:
-            for file in files:
+            for f in files:
                 try:
-                    os.remove(os.path.join(root, file))
+                    os.remove(os.path.join(root, f))
                     removed += 1
                 except Exception:
                     pass
         return removed
 
     @staticmethod
-    def scan_temp():
-        temp_dir = tempfile.gettempdir()
-        total_size, total_files = 0, 0
-        try:
-            walker = os.walk(temp_dir)
-        except Exception:
-            return {"files": 0, "size_mb": 0.0}
-        for root, _, files in walker:
-            for file in files:
-                try:
-                    p = os.path.join(root, file)
-                    total_size += os.path.getsize(p)
-                    total_files += 1
-                except Exception:
-                    pass
-        return {"files": total_files, "size_mb": round(total_size / (1024 * 1024), 2)}
-
-    @staticmethod
     def clean_temp():
         return Cleaner._delete_folder_contents(tempfile.gettempdir())
 
     @staticmethod
+    def scan_temp():
+        temp_dir = tempfile.gettempdir()
+        total, count = 0, 0
+        for root, _, files in os.walk(temp_dir):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                    count += 1
+                except Exception:
+                    pass
+        return {"files": count, "size_mb": round(total / (1024 * 1024), 2)}
+
+    @staticmethod
     def clean_recycle_bin():
         if os.name != "nt":
-            return "Solo disponible en Windows"
+            return "Solo Windows."
         try:
-            # SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND = 7
-            res = ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 7)
-            return "Papelera vaciada con éxito." if res == 0 else "Papelera ya vacía o no disponible."
+            ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 7)
+            return "Papelera vaciada."
         except Exception as e:
-            return f"No se pudo vaciar la papelera: {e}"
+            return f"Error: {e}"
 
     @staticmethod
     def clean_prefetch():
@@ -452,155 +213,124 @@ class Cleaner:
 
     @staticmethod
     def clean_logs():
+        if os.name != "nt":
+            return 0
         removed = 0
-        if os.name == "nt":
-            for path in [r"C:\Windows\Logs", r"C:\Windows\Temp"]:
-                removed += Cleaner._delete_folder_contents(path)
+        for p in [r"C:\Windows\Logs", r"C:\Windows\Temp"]:
+            removed += Cleaner._delete_folder_contents(p)
         return removed
 
     @staticmethod
     def clean_browser_cache():
-        removed = 0
-        local_app = os.environ.get("LOCALAPPDATA", "")
-        if not local_app:
+        local = os.environ.get("LOCALAPPDATA", "")
+        if not local:
             return 0
-
         targets = [
-            os.path.join(local_app, r"Google\Chrome\User Data\Default\Cache"),
-            os.path.join(local_app, r"Microsoft\Edge\User Data\Default\Cache"),
-            os.path.join(local_app, r"Mozilla\Firefox\Profiles")
+            os.path.join(local, r"Google\Chrome\User Data\Default\Cache"),
+            os.path.join(local, r"Microsoft\Edge\User Data\Default\Cache"),
+            os.path.join(local, r"Mozilla\Firefox\Profiles"),
         ]
-        for target in targets:
-            if "Firefox" in target and os.path.exists(target):
-                try:
-                    profiles = os.listdir(target)
-                except Exception:
-                    continue
-                for profile in profiles:
-                    cache_dir = os.path.join(target, profile, "cache2")
-                    removed += Cleaner._delete_folder_contents(cache_dir)
+        removed = 0
+        for t in targets:
+            if "Firefox" in t and os.path.exists(t):
+                for prof in os.listdir(t):
+                    removed += Cleaner._delete_folder_contents(
+                        os.path.join(t, prof, "cache2"))
             else:
-                removed += Cleaner._delete_folder_contents(target)
+                removed += Cleaner._delete_folder_contents(t)
         return removed
 
     @staticmethod
     def clean_old_downloads(days=30):
-        downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-        if not os.path.exists(downloads_dir):
+        dl = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.exists(dl):
             return 0, 0.0
-
-        cutoff = time.time() - (days * 86400)
+        cutoff = time.time() - days * 86400
         exts = {".exe", ".msi", ".iso", ".zip", ".rar", ".tar", ".gz"}
-        removed, freed_bytes = 0, 0
-
-        try:
-            names = os.listdir(downloads_dir)
-        except Exception:
-            return 0, 0.0
-
-        for file in names:
-            path = os.path.join(downloads_dir, file)
+        removed, freed = 0, 0
+        for f in os.listdir(dl):
+            path = os.path.join(dl, f)
             try:
                 if not os.path.isfile(path):
                     continue
-                ext = os.path.splitext(file)[1].lower()
-                if ext in exts and os.path.getmtime(path) < cutoff:
+                if (os.path.splitext(f)[1].lower() in exts
+                        and os.path.getmtime(path) < cutoff):
                     sz = os.path.getsize(path)
                     os.remove(path)
-                    freed_bytes += sz
+                    freed += sz
                     removed += 1
             except Exception:
                 pass
-        return removed, round(freed_bytes / (1024 * 1024), 2)
+        return removed, round(freed / (1024 * 1024), 2)
 
 
-class WindowsDeepCleaner:
+class DeepCleaner:
     @staticmethod
     def clean_directx_shaders():
-        local_app = os.environ.get("LOCALAPPDATA", "")
-        if not local_app:
-            return 0
-        path = os.path.join(local_app, "D3DSCache")
-        return Cleaner._delete_folder_contents(path)
+        local = os.environ.get("LOCALAPPDATA", "")
+        return Cleaner._delete_folder_contents(
+            os.path.join(local, "D3DSCache")) if local else 0
 
     @staticmethod
     def clean_crash_dumps():
-        removed = 0
-        if os.name == "nt":
-            minidump = r"C:\Windows\Minidump"
-            memory_dmp = r"C:\Windows\MEMORY.DMP"
-            removed += Cleaner._delete_folder_contents(minidump)
-            if os.path.exists(memory_dmp):
-                try:
-                    os.remove(memory_dmp)
-                    removed += 1
-                except Exception:
-                    pass
+        if os.name != "nt":
+            return 0
+        removed = Cleaner._delete_folder_contents(r"C:\Windows\Minidump")
+        mem = r"C:\Windows\MEMORY.DMP"
+        if os.path.exists(mem):
+            try:
+                os.remove(mem)
+                removed += 1
+            except Exception:
+                pass
         return removed
 
     @staticmethod
     def clean_windows_update():
         if os.name != "nt":
-            return False, "Solo disponible en Windows."
-        denied = require_admin()
-        if denied:
-            return False, denied
+            return False, "Solo Windows."
+        if not is_admin():
+            return False, "Requiere Administrador."
         code, out, err = run_hidden(
-            ["dism.exe", "/online", "/cleanup-image", "/startcomponentcleanup", "/resetbase"],
-            timeout=1800,
-        )
+            ["dism.exe", "/online", "/cleanup-image",
+             "/startcomponentcleanup", "/resetbase"], timeout=1800)
         if code == 0:
             return True, "Actualizaciones obsoletas eliminadas."
-        detail = err or out or f"código {code}"
-        return False, f"DISM no pudo completar la limpieza ({detail})."
+        return False, f"Error: {err or out or code}"
 
 
 # =========================================================
-# REPARACIÓN Y SALUD DEL SISTEMA
+# REPARACIÓN
 # =========================================================
-
-class SystemRepairManager:
+class RepairManager:
     @staticmethod
-    def run_sfc_scan():
+    def run_sfc():
         if os.name != "nt":
-            return "Solo disponible en Windows."
-        denied = require_admin()
-        if denied:
-            return denied
+            return "Solo Windows."
+        if not is_admin():
+            return "Requiere Administrador."
         code, out, err = run_hidden(["sfc", "/scannow"], timeout=1800)
-        if code == 0:
-            return "SFC completado exitosamente."
-        detail = err or out or f"código {code}"
-        return f"SFC finalizado con observaciones o errores ({detail})."
+        return "SFC completado." if code == 0 else f"SFC con observaciones: {err or out}"
 
     @staticmethod
     def run_dism_restore():
         if os.name != "nt":
-            return "Solo disponible en Windows."
-        denied = require_admin()
-        if denied:
-            return denied
+            return "Solo Windows."
+        if not is_admin():
+            return "Requiere Administrador."
         code, out, err = run_hidden(
-            ["DISM", "/Online", "/Cleanup-Image", "/RestoreHealth"],
-            timeout=1800,
-        )
-        if code == 0:
-            return "Imagen de Windows reparada."
-        detail = err or out or f"código {code}"
-        return f"Error al reparar imagen de Windows ({detail})."
+            ["DISM", "/Online", "/Cleanup-Image", "/RestoreHealth"], timeout=1800)
+        return "Imagen reparada." if code == 0 else f"Error: {err or out}"
 
     @staticmethod
-    def check_smart_disks():
+    def check_smart():
         if os.name != "nt":
             return []
-        cmd = (
-            "Get-PhysicalDisk | Select-Object FriendlyName, MediaType, "
-            "HealthStatus, OperationalStatus | ConvertTo-Json"
-        )
-        code, out, _err = run_hidden(
+        cmd = ("Get-PhysicalDisk | Select-Object FriendlyName, MediaType,"
+               "HealthStatus, OperationalStatus | ConvertTo-Json")
+        code, out, _ = run_hidden(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-            timeout=25,
-        )
+            timeout=25)
         if code != 0 or not out:
             return []
         try:
@@ -611,127 +341,142 @@ class SystemRepairManager:
 
 
 # =========================================================
-# AJUSTES DE RENDIMIENTO & HARDWARE
+# RENDIMIENTO
 # =========================================================
-
 class PerformanceTweaks:
     @staticmethod
     def enable_ultimate_performance():
         if os.name != "nt":
-            return False, "Solo disponible en Windows."
-        denied = require_admin()
-        if denied:
-            return False, denied
-        run_hidden(["powercfg", "-duplicatescheme", ULTIMATE_PERF_GUID], timeout=20)
-        code, out, err = run_hidden(["powercfg", "/list"], timeout=20)
+            return False, "Solo Windows."
+        if not is_admin():
+            return False, "Requiere Administrador."
+        run_hidden(["powercfg", "-duplicatescheme", ULTIMATE_PERF_GUID])
+        code, out, err = run_hidden(["powercfg", "/list"])
         guid = None
         if code == 0 and out:
             for line in out.splitlines():
-                if ULTIMATE_PERF_GUID.lower() in line.lower() or "ultimate" in line.lower() or "máximo rendimiento" in line.lower() or "maximo rendimiento" in line.lower():
-                    found = GUID_RE.search(line)
-                    if found:
-                        guid = found.group(0)
-                        break
-            if not guid:
-                found = GUID_RE.search(out)
-                if found:
-                    guid = found.group(0)
-        if not guid:
-            guid = ULTIMATE_PERF_GUID
-        set_code, _o, set_err = run_hidden(["powercfg", "/setactive", guid], timeout=15)
-        if set_code == 0:
-            return True, "Plan de Energía 'Máximo Rendimiento' activado."
-        return False, set_err or err or "No se pudo desbloquear el plan de energía."
+                if GUID_RE.search(line) and (
+                        "ultimate" in line.lower()
+                        or "máximo" in line.lower()
+                        or "maximo" in line.lower()):
+                    guid = GUID_RE.search(line).group(0)
+                    break
+        guid = guid or ULTIMATE_PERF_GUID
+        sc, _o, se = run_hidden(["powercfg", "/setactive", guid])
+        if sc == 0:
+            return True, "Plan 'Máximo Rendimiento' activado."
+        return False, se or err or "No se pudo activar el plan."
 
     @staticmethod
     def run_trim_ssd():
         if os.name != "nt":
-            return False, "Solo disponible en Windows."
-        denied = require_admin()
-        if denied:
-            return False, denied
+            return False, "Solo Windows."
+        if not is_admin():
+            return False, "Requiere Administrador."
         code, out, err = run_hidden(["defrag", "C:", "/O"], timeout=600)
-        if code == 0:
-            return True, "Optimización TRIM completada en el disco C:"
-        detail = err or out or f"código {code}"
-        return False, f"No se pudo optimizar el disco ({detail})."
+        return (True, "TRIM completado.") if code == 0 else (False, err or out or f"Código {code}")
 
     @staticmethod
-    def optimize_tcp_stack():
+    def optimize_tcp():
         if os.name != "nt":
-            return False, "Solo disponible en Windows."
-        denied = require_admin()
-        if denied:
-            return False, denied
+            return False, "Solo Windows."
+        if not is_admin():
+            return False, "Requiere Administrador."
         code, out, err = run_hidden(
-            ["netsh", "int", "tcp", "set", "global", "autotuninglevel=normal"],
-            timeout=20,
-        )
-        if code == 0:
-            return True, "Parámetros TCP Auto-Tuning configurados en modo normal."
-        return False, err or out or "No se pudo ajustar la pila TCP."
+            ["netsh", "int", "tcp", "set", "global", "autotuninglevel=normal"])
+        return (True, "TCP Auto-Tuning configurado.") if code == 0 else (False, err or out)
 
-
-# =========================================================
-# PRIVACIDAD & GESTIÓN DE PROGRAMAS
-# =========================================================
-
-class PrivacyAndUninstallManager:
     @staticmethod
     def disable_telemetry():
         if os.name != "nt":
-            return False, "Solo disponible en Windows."
-        denied = require_admin()
-        if denied:
-            return False, denied
-        services = ["DiagTrack", "dmwappushservice"]
+            return False, "Solo Windows."
+        if not is_admin():
+            return False, "Requiere Administrador."
         failed = []
-        for s in services:
-            run_hidden(["sc", "stop", s], timeout=15)
-            # sc exige espacio tras '=' : start= disabled
-            code, _out, err = run_hidden(["sc", "config", s, "start=", "disabled"], timeout=15)
+        for s in ["DiagTrack", "dmwappushservice"]:
+            run_hidden(["sc", "stop", s])
+            code, _o, err = run_hidden(["sc", "config", s, "start=", "disabled"])
             if code != 0:
-                failed.append(f"{s}: {err or code}")
+                failed.append(s)
         if failed:
-            return False, "No se pudieron desactivar todos los servicios: " + "; ".join(failed)
-        return True, "Servicios de telemetría y diagnóstico desactivados."
+            return False, "No se pudieron desactivar: " + ", ".join(failed)
+        return True, "Telemetría desactivada."
 
+
+# =========================================================
+# PROGRAMAS E INICIO
+# =========================================================
+class AppManager:
     @staticmethod
     def get_installed_apps():
         if os.name != "nt":
             return []
         import winreg
-        installed = []
+        results = []
         paths = [
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
-            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall")
+            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
         ]
-        access = winreg.KEY_READ
         for root, p in paths:
             try:
-                with winreg.OpenKey(root, p, 0, access) as key:
+                with winreg.OpenKey(root, p, 0, winreg.KEY_READ) as key:
                     for i in range(winreg.QueryInfoKey(key)[0]):
                         try:
-                            sub_name = winreg.EnumKey(key, i)
-                            with winreg.OpenKey(key, sub_name, 0, access) as sub_key:
-                                display_name, _ = winreg.QueryValueEx(sub_key, "DisplayName")
-                                uninstall_str, _ = winreg.QueryValueEx(sub_key, "UninstallString")
-                                if display_name and uninstall_str:
-                                    installed.append({"name": display_name, "cmd": uninstall_str})
-                        except OSError:
-                            continue
+                            sub = winreg.EnumKey(key, i)
+                            with winreg.OpenKey(key, sub, 0, winreg.KEY_READ) as sk:
+                                name, _ = winreg.QueryValueEx(sk, "DisplayName")
+                                cmd, _ = winreg.QueryValueEx(sk, "UninstallString")
+                                if name and cmd:
+                                    results.append({"name": name, "cmd": cmd})
                         except Exception:
                             continue
-            except OSError:
-                continue
             except Exception:
                 continue
-        unique = {app["name"]: app for app in installed}
-        return sorted(unique.values(), key=lambda x: x["name"].lower())
+        uniq = {a["name"]: a for a in results}
+        return sorted(uniq.values(), key=lambda x: x["name"].lower())
 
     @staticmethod
-    def uninstall_app(cmd):
+    def get_startup_apps():
+        if os.name != "nt":
+            return []
+        import winreg
+        results = []
+        keys = [
+            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", "Usuario"),
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run", "Sistema"),
+        ]
+        for root, subkey, scope in keys:
+            try:
+                with winreg.OpenKey(root, subkey, 0, winreg.KEY_READ) as key:
+                    for i in range(winreg.QueryInfoKey(key)[1]):
+                        try:
+                            name, val, _ = winreg.EnumValue(key, i)
+                            results.append({"name": name, "cmd": str(val), "scope": scope})
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+        return results
+
+    @staticmethod
+    def remove_startup(name, scope="Usuario"):
+        if os.name != "nt":
+            return False, "Solo Windows."
+        import winreg
+        root = winreg.HKEY_CURRENT_USER if scope == "Usuario" else winreg.HKEY_LOCAL_MACHINE
+        if scope != "Usuario" and not is_admin():
+            return False, "Requiere Administrador para el ámbito Sistema."
+        try:
+            with winreg.OpenKey(root, r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                0, winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, name)
+            return True, f"'{name}' eliminado del arranque."
+        except Exception as e:
+            return False, str(e)
+
+    @staticmethod
+    def uninstall(cmd):
         try:
             kwargs = {"shell": True, "stdin": subprocess.DEVNULL}
             if os.name == "nt":
@@ -742,56 +487,11 @@ class PrivacyAndUninstallManager:
             return False, str(e)
 
 
-class StartupManager:
-    @staticmethod
-    def get_startup_apps():
-        if os.name != "nt":
-            return []
-        import winreg
-        startup_apps = []
-        keys = [
-            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", "Usuario Actual"),
-            (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run", "Todo el Sistema")
-        ]
-        for root_key, subkey, scope in keys:
-            try:
-                with winreg.OpenKey(root_key, subkey, 0, winreg.KEY_READ) as key:
-                    for i in range(winreg.QueryInfoKey(key)[1]):
-                        try:
-                            name, val, _ = winreg.EnumValue(key, i)
-                            startup_apps.append({"name": name, "command": str(val), "scope": scope})
-                        except OSError:
-                            continue
-            except OSError:
-                pass
-            except Exception:
-                pass
-        return startup_apps
-
-    @staticmethod
-    def remove_startup_app(name, scope="Usuario Actual"):
-        if os.name != "nt":
-            return False, "Solo disponible en Windows."
-        import winreg
-        root_key = winreg.HKEY_CURRENT_USER if scope == "Usuario Actual" else winreg.HKEY_LOCAL_MACHINE
-        if scope != "Usuario Actual" and not is_admin():
-            return False, require_admin()
-        try:
-            with winreg.OpenKey(root_key, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE) as key:
-                winreg.DeleteValue(key, name)
-            return True, f"'{name}' eliminado del arranque."
-        except OSError as e:
-            return False, f"No se pudo modificar el registro: {e}"
-        except Exception as e:
-            return False, str(e)
-
-
 # =========================================================
-# NETWORK & PROCESS MANAGERS
+# RED
 # =========================================================
-
 class NetworkManager:
-    _public_ip_cache = {"value": None, "ts": 0.0}
+    _ip_cache = {"v": None, "t": 0}
 
     @staticmethod
     def get_local_ip():
@@ -804,41 +504,41 @@ class NetworkManager:
         except Exception:
             return "No disponible"
         finally:
-            if s is not None:
-                try:
-                    s.close()
-                except Exception:
-                    pass
+            if s:
+                s.close()
 
     @staticmethod
     def get_public_ip():
         now = time.time()
-        cached = NetworkManager._public_ip_cache
-        ttl = 30 if cached.get("value") == "No disponible" else 120
-        if cached.get("value") is not None and now - cached["ts"] < ttl:
-            return cached["value"]
+        c = NetworkManager._ip_cache
+        if c["v"] and now - c["t"] < 120:
+            return c["v"]
+        if requests is None:
+            return "Falta requests"
         try:
-            ip = requests.get("https://api.ipify.org", timeout=2).text.strip()
-            value = ip or "No disponible"
+            ip = requests.get("https://api.ipify.org", timeout=3).text.strip()
+            NetworkManager._ip_cache = {"v": ip or "N/D", "t": now}
+            return ip or "No disponible"
         except Exception:
-            value = "No disponible"
-        NetworkManager._public_ip_cache = {"value": value, "ts": now}
-        return value
+            return "No disponible"
 
     @staticmethod
-    def ping_host(host="8.8.8.8"):
+    def ping(host="8.8.8.8"):
         try:
-            cmd = ["ping", "-n", "1", "-w", "2000", host] if os.name == "nt" else ["ping", "-c", "1", host]
+            cmd = (["ping", "-n", "1", "-w", "2000", host]
+                   if os.name == "nt" else ["ping", "-c", "1", host])
             start = time.time()
-            code, _out, _err = run_hidden(cmd, timeout=6)
-            if code == 0:
-                return round((time.time() - start) * 1000, 2)
-            return -1
+            code, _o, _e = run_hidden(cmd, timeout=6)
+            return round((time.time() - start) * 1000, 2) if code == 0 else -1
         except Exception:
             return -1
 
     @staticmethod
-    def speed_test():
+    def speedtest():
+        try:
+            import speedtest
+        except ImportError:
+            return {"success": False, "error": "Instala: pip install speedtest-cli"}
         try:
             st = speedtest.Speedtest()
             st.get_best_server()
@@ -846,787 +546,1081 @@ class NetworkManager:
                 "success": True,
                 "download": round(st.download() / 1_000_000, 2),
                 "upload": round(st.upload() / 1_000_000, 2),
-                "ping": round(st.results.ping, 2)
+                "ping": round(st.results.ping, 2),
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
 
     @staticmethod
     def flush_dns():
-        try:
-            cmd = ["ipconfig", "/flushdns"] if os.name == "nt" else ["resolvectl", "flush-caches"]
-            code, _out, _err = run_hidden(cmd, timeout=15)
-            return code == 0
-        except Exception:
-            return False
+        cmd = ["ipconfig", "/flushdns"] if os.name == "nt" else ["resolvectl", "flush-caches"]
+        code, _o, _e = run_hidden(cmd, timeout=15)
+        return code == 0
 
     @staticmethod
-    def set_fast_dns(interface_name="Wi-Fi", primary="1.1.1.1", secondary="1.0.0.1"):
+    def set_fast_dns(adapter="Wi-Fi", primary="1.1.1.1", secondary="1.0.0.1"):
         if os.name != "nt":
-            return False, "Solo disponible en Windows."
-        denied = require_admin()
-        if denied:
-            return False, denied
-        iface = f'name={interface_name}'
-        code1, _o1, e1 = run_hidden(
-            ["netsh", "interface", "ip", "set", "dns", iface, "static", primary],
-            timeout=20,
-        )
+            return False, "Solo Windows."
+        if not is_admin():
+            return False, "Requiere Administrador."
+        iface = f"name={adapter}"
+        c1, _o, e = run_hidden(
+            ["netsh", "interface", "ip", "set", "dns", iface, "static", primary])
         run_hidden(
-            ["netsh", "interface", "ip", "add", "dns", iface, secondary, "index=2"],
-            timeout=20,
-        )
-        run_hidden(["ipconfig", "/flushdns"], timeout=15)
-        if code1 == 0:
+            ["netsh", "interface", "ip", "add", "dns", iface, secondary, "index=2"])
+        run_hidden(["ipconfig", "/flushdns"])
+        if c1 == 0:
             return True, f"DNS ajustados a {primary} y {secondary}."
-        return False, e1 or "No se pudo cambiar el DNS. Comprueba el nombre del adaptador."
+        return False, e or "No se pudo cambiar el DNS. ¿Adaptador correcto?"
 
 
-class ProcessManager:
-    @staticmethod
-    def top_cpu_processes(limit=5):
-        procs = []
-        for proc in psutil.process_iter(["pid", "name", "cpu_percent"]):
-            try:
-                procs.append(proc.info)
-            except (psutil.Error, Exception):
-                pass
-        procs.sort(key=lambda x: x["cpu_percent"] or 0, reverse=True)
-        return procs[:limit]
+# =========================================================
+# RAM - OPTIMIZACIÓN REAL
+# =========================================================
+class _LUID(ctypes.Structure):
+    _fields_ = [("LowPart", ctypes.c_ulong), ("HighPart", ctypes.c_long)]
 
-    @staticmethod
-    def top_ram_processes(limit=5):
-        procs = []
-        for proc in psutil.process_iter(["pid", "name", "memory_percent", "memory_info"]):
-            try:
-                info = proc.info
-                mem_mb = round(info["memory_info"].rss / (1024 * 1024), 2) if info.get("memory_info") else 0
-                procs.append({
-                    "pid": info["pid"],
-                    "name": info["name"],
-                    "memory_percent": round(info["memory_percent"] or 0, 2),
-                    "memory_mb": mem_mb
-                })
-            except (psutil.Error, Exception):
-                pass
-        procs.sort(key=lambda x: x["memory_percent"], reverse=True)
-        return procs[:limit]
+class _LUID_ATTR(ctypes.Structure):
+    _fields_ = [("Luid", _LUID), ("Attributes", ctypes.c_ulong)]
 
-    @staticmethod
-    def optimize_ram():
-        freed = 0
-        if os.name != "nt":
-            return freed
+class _TOKEN_PRIV(ctypes.Structure):
+    _fields_ = [("PrivilegeCount", ctypes.c_ulong),
+                ("Privileges", _LUID_ATTR * 1)]
+
+
+def _enable_privilege(name):
+    if os.name != "nt":
+        return False
+    try:
+        advapi = ctypes.windll.advapi32
+        kernel = ctypes.windll.kernel32
+        token = ctypes.c_void_p()
+        if not advapi.OpenProcessToken(
+                kernel.GetCurrentProcess(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ctypes.byref(token)):
+            return False
         try:
-            open_process = ctypes.windll.kernel32.OpenProcess
-            close_handle = ctypes.windll.kernel32.CloseHandle
-            empty_ws = ctypes.windll.psapi.EmptyWorkingSet
-            open_process.restype = ctypes.c_void_p
-            close_handle.argtypes = [ctypes.c_void_p]
-            empty_ws.argtypes = [ctypes.c_void_p]
-        except Exception:
-            return 0
+            luid = _LUID()
+            if not advapi.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
+                return False
+            tp = _TOKEN_PRIV()
+            tp.PrivilegeCount = 1
+            tp.Privileges[0].Luid = luid
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+            return bool(advapi.AdjustTokenPrivileges(
+                token, False, ctypes.byref(tp), 0, None, None))
+        finally:
+            kernel.CloseHandle(token)
+    except Exception:
+        return False
 
-        for proc in psutil.process_iter(["pid"]):
-            handle = None
-            try:
-                pid = proc.info["pid"]
-                if not pid or pid == 0:
-                    continue
-                handle = open_process(PROCESS_TRIM_ACCESS, False, pid)
-                if handle:
-                    empty_ws(handle)
-                    freed += 1
-            except Exception:
+
+def _purge_standby():
+    if os.name != "nt" or not is_admin():
+        return False
+    if not _enable_privilege("SeProfileSingleProcessPrivilege"):
+        return False
+    try:
+        cmd = ctypes.c_int(MEMORY_PURGE_STANDBY_LIST)
+        return ctypes.windll.ntdll.NtSetSystemInformation(
+            SYSTEM_MEMORY_LIST_INFO, ctypes.byref(cmd),
+            ctypes.sizeof(cmd)) == 0
+    except Exception:
+        return False
+
+
+def _clear_file_cache():
+    if os.name != "nt" or not is_admin():
+        return False
+    if not _enable_privilege("SeIncreaseQuotaPrivilege"):
+        return False
+    try:
+        invalid = ctypes.c_size_t(-1).value
+        return bool(ctypes.windll.kernel32.SetSystemFileCacheSize(
+            invalid, invalid, 0))
+    except Exception:
+        return False
+
+
+def _empty_working_sets():
+    if os.name != "nt":
+        return 0
+    try:
+        op = ctypes.windll.kernel32.OpenProcess
+        cl = ctypes.windll.kernel32.CloseHandle
+        ew = ctypes.windll.psapi.EmptyWorkingSet
+        op.restype = ctypes.c_void_p
+        cl.argtypes = [ctypes.c_void_p]
+        ew.argtypes = [ctypes.c_void_p]
+    except Exception:
+        return 0
+    count = 0
+    for p in psutil.process_iter(["pid"]):
+        h = None
+        try:
+            pid = p.info["pid"]
+            if not pid:
                 continue
-            finally:
-                if handle:
-                    try:
-                        close_handle(handle)
-                    except Exception:
-                        pass
-        return freed
+            h = op(PROCESS_TRIM_ACCESS, False, pid)
+            if h:
+                ew(h)
+                count += 1
+        except Exception:
+            pass
+        finally:
+            if h:
+                try:
+                    cl(h)
+                except Exception:
+                    pass
+    return count
 
 
+def optimize_ram_real():
+    result = {
+        "before_gb": 0.0, "after_gb": 0.0, "freed_mb": 0.0,
+        "trimmed": 0, "standby": False, "filecache": False,
+        "needs_admin": not is_admin(),
+    }
+    if os.name != "nt":
+        return result
+    before = psutil.virtual_memory()
+    result["before_gb"] = round(before.used / (1024**3), 2)
+
+    result["trimmed"]   = _empty_working_sets()
+    result["standby"]   = _purge_standby()
+    result["filecache"] = _clear_file_cache()
+
+    time.sleep(0.6)
+    after = psutil.virtual_memory()
+    result["after_gb"] = round(after.used / (1024**3), 2)
+    result["freed_mb"] = round((before.used - after.used) / (1024 * 1024), 2)
+    return result
+
+
+# =========================================================
+# REPORTES
+# =========================================================
 class ReportGenerator:
     @staticmethod
-    def generate_full_report():
-        try:
-            os.makedirs(REPORTS_DIR, exist_ok=True)
-        except Exception as e:
-            raise RuntimeError(f"No se pudo crear la carpeta de informes: {e}") from e
-        system_info = SystemInfo.get_info()
-        report_data = {
+    def generate():
+        info = SystemInfo.get_info()
+        report = {
             "generated_at": datetime.now().isoformat(),
-            "system": system_info,
-            "health": AdvancedHealthAnalyzer.calculate(system_info),
+            "system": info,
+            "health": HealthAnalyzer.calculate(info),
             "temp_scan": Cleaner.scan_temp(),
             "network": {
                 "local_ip": NetworkManager.get_local_ip(),
                 "public_ip": NetworkManager.get_public_ip(),
-                "google_ping_ms": NetworkManager.ping_host("8.8.8.8"),
-                "cloudflare_ping_ms": NetworkManager.ping_host("1.1.1.1")
+                "ping_google": NetworkManager.ping("8.8.8.8"),
+                "ping_cloudflare": NetworkManager.ping("1.1.1.1"),
             },
-            "top_cpu_processes": ProcessManager.top_cpu_processes(5),
-            "top_ram_processes": ProcessManager.top_ram_processes(5)
         }
-        filename = os.path.join(REPORTS_DIR, f"system_report_{int(time.time())}.json")
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(report_data, f, indent=4, ensure_ascii=False)
-        return filename
+        fname = os.path.join(REPORTS_DIR, f"report_{int(time.time())}.json")
+        with open(fname, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=4, ensure_ascii=False)
+        return fname
+
 
 # =========================================================
-# MENUS
+# AI HUB (Gemini)
 # =========================================================
+class AIHub:
+    @staticmethod
+    def test_gemini_key(key):
+        if requests is None:
+            return False, "Falta 'requests'."
+        try:
+            url = "https://generativelanguage.googleapis.com/v1beta/models"
+            r = requests.get(url, params={"key": key}, timeout=10)
+            if r.status_code == 400:
+                return False, "API Key inválida (400)."
+            if r.status_code == 403:
+                return False, "Cuota bloqueada (403)."
+            if r.status_code != 200:
+                return False, f"Error servidor ({r.status_code})."
+            data = r.json()
+            models = [m["name"].replace("models/", "")
+                      for m in data.get("models", [])
+                      if "generateContent" in m.get("supportedGenerationMethods", [])]
+            if not models:
+                return False, "Sin modelos disponibles."
+            selected = next((m for m in models if "flash" in m.lower()), models[0])
+            return True, selected
+        except Exception as e:
+            return False, f"Error: {e}"
 
-def cleaner_menu():
-    while True:
-        console.clear()
-        console.print(Panel("[bold cyan]CENTRO DE LIMPIEZA & ESPACIO[/bold cyan]", box=box.ROUNDED))
-        console.print("[1] Escanear y Limpiar Temporales (TEMP)")
-        console.print("[2] Vaciar Papelera de Reciclaje")
-        console.print("[3] Limpiar Caché de Navegadores (Chrome/Edge/Firefox)")
-        console.print("[4] Limpiar Shaders DirectX y Crash Dumps")
-        console.print("[5] Limpiar Prefetch y Logs del Sistema")
-        console.print("[6] Limpiar Actualizaciones Obsoletas de Windows (DISM)")
-        console.print("[7] Limpiar Instaladores Antiguos en Descargas (>30 días)")
-        console.print("[8] [bold green]MANTENIMIENTO Y LIMPIEZA COMPLETA[/bold green]")
-        console.print("[0] Volver al menú principal\n")
+    @staticmethod
+    def diagnose(key, model, summary):
+        if requests is None:
+            return "Falta 'requests'."
+        try:
+            url = (f"https://generativelanguage.googleapis.com/v1beta/"
+                   f"models/{model}:generateContent")
+            prompt = (
+                "Eres AvizorCleaner. Analiza estas métricas y entrega un dictamen "
+                f"en 3 puntos (estado, cuello de botella, 2 recomendaciones):\n\n{summary}"
+            )
+            r = requests.post(url, params={"key": key},
+                              json={"contents": [{"parts": [{"text": prompt}]}]},
+                              timeout=15)
+            if r.status_code == 200:
+                return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            return f"Error: {r.status_code}"
+        except Exception as e:
+            return f"Error: {e}"
 
-        opt = Prompt.ask("[bold yellow]Seleccione una opción[/bold yellow]", default="0")
 
-        if opt == "1":
-            rem = Cleaner.clean_temp()
-            console.print(f"[green]Eliminados {rem} archivos temporales.[/green]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "2":
-            console.print(f"[cyan]{Cleaner.clean_recycle_bin()}[/cyan]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "3":
-            rem = Cleaner.clean_browser_cache()
-            console.print(f"[green]Eliminados {rem} archivos de caché de navegadores.[/green]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "4":
-            dx = WindowsDeepCleaner.clean_directx_shaders()
-            dumps = WindowsDeepCleaner.clean_crash_dumps()
-            console.print(f"[green]Eliminados {dx} shaders DirectX y {dumps} volcados de memoria.[/green]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "5":
+# =========================================================
+# GUI
+# =========================================================
+class AvizorApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+
+        self.title("AvizorCleaner Pro — Mantenimiento Windows")
+        self.geometry("1180x780")
+        self.minsize(1000, 700)
+
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.current_page = "dashboard"
+        self._pages = {}
+        self._ai_key = None
+        self._ai_model = None
+        self._dashboard_job = None
+
+        self._build_sidebar()
+        self._build_content()
+        self._show_page("dashboard")
+
+    # -------------------- SIDEBAR --------------------
+    def _build_sidebar(self):
+        self.sidebar = ctk.CTkFrame(self, width=230, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_rowconfigure(20, weight=1)
+
+        title = ctk.CTkLabel(
+            self.sidebar, text="◆ AVIZOR\nCLEANER PRO",
+            font=ctk.CTkFont(size=20, weight="bold"), justify="center")
+        title.grid(row=0, column=0, padx=20, pady=(25, 5))
+
+        subtitle = ctk.CTkLabel(
+            self.sidebar, text="v2.0 · GUI Edition",
+            font=ctk.CTkFont(size=11), text_color="#6b7280")
+        subtitle.grid(row=1, column=0, pady=(0, 25))
+
+        items = [
+            ("dashboard", "🏠  Dashboard"),
+            ("cleaner",   "🧹  Limpieza"),
+            ("perf",      "⚡  Rendimiento"),
+            ("programs",  "📦  Programas"),
+            ("ram",       "🧠  Memoria RAM"),
+            ("network",   "🌐  Red & DNS"),
+            ("ai",        "✨  AI Hub"),
+        ]
+        self.nav_buttons = {}
+        for i, (key, label) in enumerate(items, start=2):
+            btn = ctk.CTkButton(
+                self.sidebar, text=label, anchor="w", height=42,
+                font=ctk.CTkFont(size=14),
+                fg_color="transparent", hover_color="#1f2937",
+                command=lambda k=key: self._show_page(k))
+            btn.grid(row=i, column=0, padx=12, pady=3, sticky="ew")
+            self.nav_buttons[key] = btn
+
+        self.admin_label = ctk.CTkLabel(
+            self.sidebar, text="Verificando permisos...",
+            font=ctk.CTkFont(size=11), text_color="#6b7280")
+        self.admin_label.grid(row=21, column=0, padx=12, pady=15, sticky="sw")
+        self.after(100, self._update_admin_label)
+
+    def _update_admin_label(self):
+        if is_admin():
+            self.admin_label.configure(text="✓ Admin", text_color="#22c55e")
+        else:
+            self.admin_label.configure(text="⚠ Sin Admin", text_color="#f59e0b")
+
+    # -------------------- CONTENT LAYOUT --------------------
+    def _build_content(self):
+        self.content = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        self.content.grid(row=0, column=1, sticky="nsew")
+        self.content.grid_columnconfigure(0, weight=1)
+        self.content.grid_rowconfigure(0, weight=1)
+        self.content.grid_rowconfigure(1, weight=0)
+
+        self.page_container = ctk.CTkFrame(
+            self.content, corner_radius=0, fg_color="transparent")
+        self.page_container.grid(row=0, column=0, sticky="nsew")
+        self.page_container.grid_columnconfigure(0, weight=1)
+        self.page_container.grid_rowconfigure(0, weight=1)
+
+        # Log area at bottom
+        log_frame = ctk.CTkFrame(self.content, height=140)
+        log_frame.grid(row=1, column=0, sticky="ew", padx=15, pady=(5, 15))
+        log_frame.grid_columnconfigure(0, weight=1)
+        log_frame.grid_rowconfigure(1, weight=1)
+
+        log_title = ctk.CTkLabel(
+            log_frame, text="📋  Actividad",
+            font=ctk.CTkFont(size=12, weight="bold"), anchor="w")
+        log_title.grid(row=0, column=0, sticky="w", padx=12, pady=(8, 4))
+
+        self.log_box = ctk.CTkTextbox(
+            log_frame, height=100,
+            font=ctk.CTkFont(family="Consolas", size=12),
+            wrap="word")
+        self.log_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 10))
+        self.log_box.configure(state="disabled")
+        self._log("AvizorCleaner Pro iniciado. Selecciona un módulo.", "info")
+
+    # -------------------- NAVIGATION --------------------
+    def _show_page(self, name):
+        if self._dashboard_job:
+            self.after_cancel(self._dashboard_job)
+            self._dashboard_job = None
+
+        for k, b in self.nav_buttons.items():
+            b.configure(fg_color="#1f538d" if k == name else "transparent")
+
+        for w in self.page_container.winfo_children():
+            w.destroy()
+
+        builder = getattr(self, f"_page_{name}", None)
+        if builder:
+            builder()
+        self.current_page = name
+
+    # -------------------- HELPERS --------------------
+    def _log(self, msg, level="info"):
+        prefix = {"info": "ℹ️", "ok": "✅", "warn": "⚠️", "err": "❌"}.get(level, "·")
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", f"[{ts}] {prefix}  {msg}\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def _clear_log(self):
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+
+    def _run_async(self, fn, on_done):
+        def worker():
+            try:
+                result = fn()
+                self.after(0, lambda: on_done(result))
+            except Exception as e:
+                self.after(0, lambda: self._log(f"Error: {e}", "err"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _page_header(self, parent, title, what, why):
+        header = ctk.CTkFrame(parent, corner_radius=12)
+        header.pack(fill="x", pady=(0, 16))
+
+        ctk.CTkLabel(header, text=title,
+                     font=ctk.CTkFont(size=26, weight="bold"))\
+            .pack(anchor="w", padx=22, pady=(18, 4))
+        ctk.CTkLabel(header, text=what, wraplength=800,
+                     font=ctk.CTkFont(size=14), justify="left")\
+            .pack(anchor="w", padx=22)
+        ctk.CTkLabel(header, text=why, wraplength=800,
+                     font=ctk.CTkFont(size=12), text_color="#9ca3af",
+                     justify="left")\
+            .pack(anchor="w", padx=22, pady=(4, 18))
+
+    def _action_card(self, parent, title, desc, command, emoji="▶"):
+        card = ctk.CTkFrame(parent, corner_radius=10)
+        card.pack(fill="x", pady=4)
+
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=15, pady=12)
+        row.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(row, text=emoji, font=ctk.CTkFont(size=22))\
+            .grid(row=0, column=0, rowspan=2, padx=(0, 15))
+
+        ctk.CTkLabel(row, text=title, font=ctk.CTkFont(size=14, weight="bold"),
+                     anchor="w").grid(row=0, column=1, sticky="w")
+        ctk.CTkLabel(row, text=desc, font=ctk.CTkFont(size=12),
+                     text_color="#9ca3af", anchor="w", wraplength=560)\
+            .grid(row=1, column=1, sticky="w", pady=(2, 0))
+
+        ctk.CTkButton(row, text="Ejecutar", width=100, command=command)\
+            .grid(row=0, column=2, rowspan=2, padx=(10, 0))
+
+    # =====================================================
+    # PAGE: DASHBOARD
+    # =====================================================
+    def _page_dashboard(self):
+        frame = ctk.CTkScrollableFrame(self.page_container, corner_radius=0)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        self._page_header(
+            frame, "Dashboard",
+            "Estado general del equipo en tiempo real.",
+            "Métricas de CPU, RAM y Disco con indicador de salud global. "
+            "Se actualiza cada 2 segundos.")
+
+        # Metrics
+        cards = ctk.CTkFrame(frame, fg_color="transparent")
+        cards.pack(fill="x", pady=(0, 20))
+        cards.grid_columnconfigure((0, 1, 2), weight=1)
+
+        self.cpu_card = self._metric_card(cards, "CPU", 0, "🖥")
+        self.ram_card = self._metric_card(cards, "RAM", 1, "🧠")
+        self.disk_card = self._metric_card(cards, "Disco", 2, "💾")
+
+        # Health
+        self.health_frame = ctk.CTkFrame(frame, corner_radius=12)
+        self.health_frame.pack(fill="x", pady=(0, 20))
+        self.health_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(self.health_frame, text="SALUD DEL SISTEMA",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color="#9ca3af")\
+            .grid(row=0, column=0, columnspan=2, sticky="w", padx=20, pady=(15, 5))
+
+        self.health_score = ctk.CTkLabel(
+            self.health_frame, text="--",
+            font=ctk.CTkFont(size=42, weight="bold"))
+        self.health_score.grid(row=1, column=0, padx=20, pady=(0, 15))
+
+        self.health_status = ctk.CTkLabel(
+            self.health_frame, text="Calculando...",
+            font=ctk.CTkFont(size=18))
+        self.health_status.grid(row=1, column=1, sticky="w", pady=(0, 15))
+
+        # System info
+        info_card = ctk.CTkFrame(frame, corner_radius=12)
+        info_card.pack(fill="x", pady=(0, 20))
+
+        ctk.CTkLabel(info_card, text="INFORMACIÓN DEL SISTEMA",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color="#9ca3af")\
+            .pack(anchor="w", padx=20, pady=(15, 10))
+
+        self.info_box = ctk.CTkTextbox(
+            info_card, height=140,
+            font=ctk.CTkFont(family="Consolas", size=12))
+        self.info_box.pack(fill="x", padx=20, pady=(0, 15))
+
+        # Quick report
+        quick = ctk.CTkFrame(frame, corner_radius=12)
+        quick.pack(fill="x")
+
+        ctk.CTkLabel(quick, text="ACCIÓN RÁPIDA",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color="#9ca3af")\
+            .pack(anchor="w", padx=20, pady=(15, 5))
+
+        ctk.CTkButton(
+            quick, text="📄  Generar informe JSON",
+            height=40, command=self._action_report)\
+            .pack(anchor="w", padx=20, pady=(0, 20))
+
+        self._refresh_dashboard()
+
+    def _metric_card(self, parent, label, col, emoji):
+        card = ctk.CTkFrame(parent, corner_radius=12)
+        card.grid(row=0, column=col, padx=8, sticky="ew")
+
+        header = ctk.CTkFrame(card, fg_color="transparent")
+        header.pack(fill="x", padx=15, pady=(15, 5))
+
+        ctk.CTkLabel(header, text=f"{emoji}  {label}",
+                     font=ctk.CTkFont(size=13, weight="bold"))\
+            .pack(side="left")
+
+        value = ctk.CTkLabel(card, text="--%",
+                             font=ctk.CTkFont(size=34, weight="bold"))
+        value.pack(anchor="w", padx=15)
+
+        bar = ctk.CTkProgressBar(card, height=8)
+        bar.pack(fill="x", padx=15, pady=(5, 5))
+        bar.set(0)
+
+        sub = ctk.CTkLabel(card, text="",
+                           font=ctk.CTkFont(size=11), text_color="#9ca3af")
+        sub.pack(anchor="w", padx=15, pady=(0, 15))
+
+        return {"value": value, "bar": bar, "sub": sub}
+
+    def _refresh_dashboard(self):
+        if self.current_page != "dashboard":
+            return
+        try:
+            info = SystemInfo.get_info()
+            health = HealthAnalyzer.calculate(info)
+
+            for card, pct, subtext in [
+                (self.cpu_card, info["cpu_usage"], f"{info['cpu_cores']} núcleos"),
+                (self.ram_card, info["ram_usage"],
+                 f"{info['ram_free_gb']} GB libres de {info['ram_total_gb']} GB"),
+                (self.disk_card, info["disk_usage"],
+                 f"{info['disk_free_gb']} GB libres de {info['disk_total_gb']} GB"),
+            ]:
+                color = "#22c55e" if pct < 60 else ("#f59e0b" if pct <= 80 else "#ef4444")
+                card["value"].configure(text=f"{pct:.1f}%", text_color=color)
+                card["bar"].configure(progress_color=color)
+                card["bar"].set(pct / 100)
+                card["sub"].configure(text=subtext)
+
+            self.health_score.configure(
+                text=f"{health['score']}", text_color=health["color"])
+            self.health_status.configure(
+                text=f"{health['status']}  ·  {info['os']}",
+                text_color=health["color"])
+
+            self.info_box.configure(state="normal")
+            self.info_box.delete("1.0", "end")
+            self.info_box.insert("1.0", (
+                f"Host:       {info['hostname']}\n"
+                f"SO:         {info['os']}\n"
+                f"Admin:      {'Sí' if info['is_admin'] else 'No'}\n"
+                f"IP pública: {NetworkManager.get_public_ip()}\n"
+                f"Timestamp:  {info['timestamp']}\n"))
+            self.info_box.configure(state="disabled")
+        except Exception as e:
+            self._log(f"Dashboard error: {e}", "err")
+
+        self._dashboard_job = self.after(2000, self._refresh_dashboard)
+
+    def _action_report(self):
+        self._log("Generando informe JSON...", "info")
+        self._run_async(
+            ReportGenerator.generate,
+            lambda r: self._log(f"Informe generado en: {r}", "ok"))
+
+    # =====================================================
+    # PAGE: CLEANER
+    # =====================================================
+    def _page_cleaner(self):
+        frame = ctk.CTkScrollableFrame(self.page_container, corner_radius=0)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        self._page_header(
+            frame, "Limpieza & Espacio",
+            "Libera espacio en disco borrando archivos innecesarios.",
+            "Cada acción actúa sobre ubicaciones concretas del sistema. "
+            "Ninguna toca documentos personales (la opción 7 SÍ borra Descargas antiguas "
+            "tras confirmación).")
+
+        self._action_card(frame, "Temporales (TEMP)",
+            "Archivos temporales de Windows y aplicaciones.",
+            self._act_clean_temp, "🧹")
+        self._action_card(frame, "Papelera de Reciclaje",
+            "Elimina definitivamente lo que ya habías borrado.",
+            self._act_clean_recycle, "🗑")
+        self._action_card(frame, "Caché de Navegadores",
+            "Chrome, Edge y Firefox.",
+            self._act_clean_browsers, "🌐")
+        self._action_card(frame, "Shaders DirectX + Crash Dumps",
+            "Libera MB tras juegos/apps que fallaron.",
+            self._act_clean_shaders, "🎮")
+        self._action_card(frame, "Prefetch y Logs",
+            "Windows los regenera en el próximo arranque.",
+            self._act_clean_prefetch, "📝")
+        self._action_card(frame, "Actualizaciones antiguas (DISM)",
+            "Solo componentes obsoletos de Windows Update. Tarda minutos.",
+            self._act_clean_dism, "♻")
+        self._action_card(frame, "Descargas >30 días",
+            "Borra .exe/.msi/.iso/.zip antiguos de la carpeta Descargas.",
+            self._act_clean_downloads, "📥")
+
+        # Full cleanup
+        ctk.CTkButton(
+            frame, text="🚀  LIMPIEZA COMPLETA (TEMP + Navegadores + Shaders + Prefetch + Papelera)",
+            height=48, fg_color="#16a34a", hover_color="#15803d",
+            command=self._act_clean_full)\
+            .pack(fill="x", pady=(20, 5))
+
+    def _act_clean_temp(self):
+        self._log("Limpiando TEMP...", "info")
+        self._run_async(Cleaner.clean_temp,
+            lambda r: self._log(f"Temporales eliminados: {r} archivos.", "ok"))
+
+    def _act_clean_recycle(self):
+        self._log("Vaciando papelera...", "info")
+        self._run_async(Cleaner.clean_recycle_bin,
+            lambda r: self._log(str(r), "ok"))
+
+    def _act_clean_browsers(self):
+        self._log("Limpiando caché de navegadores...", "info")
+        self._run_async(Cleaner.clean_browser_cache,
+            lambda r: self._log(f"Archivos de caché eliminados: {r}.", "ok"))
+
+    def _act_clean_shaders(self):
+        self._log("Limpiando shaders y dumps...", "info")
+        def work():
+            dx = DeepCleaner.clean_directx_shaders()
+            dumps = DeepCleaner.clean_crash_dumps()
+            return dx, dumps
+        self._run_async(work,
+            lambda r: self._log(f"Shaders: {r[0]} · Dumps: {r[1]}.", "ok"))
+
+    def _act_clean_prefetch(self):
+        self._log("Limpiando Prefetch y Logs...", "info")
+        def work():
             p = Cleaner.clean_prefetch()
             l = Cleaner.clean_logs()
-            console.print(f"[green]Eliminados {p} archivos Prefetch y {l} logs.[/green]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "6":
-            with console.status("[bold cyan]Ejecutando limpieza de paquetes con DISM (puede tardar minutos)..."):
-                ok, msg = WindowsDeepCleaner.clean_windows_update()
-            console.print(f"[bold]{msg}[/bold]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "7":
-            c, mb = Cleaner.clean_old_downloads(30)
-            console.print(f"[green]Descargas eliminadas:[/green] {c} archivos ({mb} MB liberados).")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "8":
-            with console.status("[bold green]Limpieza profunda en curso..."):
-                t = Cleaner.clean_temp()
-                b = Cleaner.clean_browser_cache()
-                p = Cleaner.clean_prefetch()
-                l = Cleaner.clean_logs()
-                dx = WindowsDeepCleaner.clean_directx_shaders()
-                r = Cleaner.clean_recycle_bin()
-            console.print(f"\n[bold green]Limpieza terminada:[/bold green]\n- TEMP: {t} | Navegadores: {b} | Shaders: {dx} | Prefetch: {p} | Logs: {l}\n- {r}")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "0":
-            break
+            return p, l
+        self._run_async(work,
+            lambda r: self._log(f"Prefetch: {r[0]} · Logs: {r[1]}.", "ok"))
 
+    def _act_clean_dism(self):
+        self._log("Ejecutando DISM cleanup (puede tardar)...", "info")
+        self._run_async(DeepCleaner.clean_windows_update,
+            lambda r: self._log(str(r[1]),
+                "ok" if r[0] else "warn"))
 
-def performance_and_repair_menu():
-    while True:
-        console.clear()
-        console.print(Panel("[bold cyan]RENDIMIENTO, HARDWARE & REPARACIÓN[/bold cyan]", box=box.ROUNDED))
-        console.print("[1] Activar Plan de Energía 'Máximo Rendimiento' (Ultimate)")
-        console.print("[2] Ejecutar TRIM / Optimización en SSD (defrag /O)")
-        console.print("[3] Optimizar Pila TCP (Auto-Tuning)")
-        console.print("[4] Comprobar Integridad del Sistema (SFC /scannow)")
-        console.print("[5] Reparar Imagen de Windows (DISM RestoreHealth)")
-        console.print("[6] Diagnóstico de Salud de Discos (S.M.A.R.T.)")
-        console.print("[7] Desactivar Telemetría y Rastreo de Windows")
-        console.print("[0] Volver\n")
+    def _act_clean_downloads(self):
+        ok = messagebox.askyesno(
+            "Confirmar",
+            "Se borrarán .exe/.msi/.iso/.zip de Descargas con más de 30 días.\n\n¿Continuar?")
+        if not ok:
+            return
+        self._log("Limpiando Descargas antiguas...", "info")
+        self._run_async(lambda: Cleaner.clean_old_downloads(30),
+            lambda r: self._log(f"Eliminados {r[0]} archivos ({r[1]} MB).", "ok"))
 
-        opt = Prompt.ask("[bold yellow]Seleccione una opción[/bold yellow]", default="0")
+    def _act_clean_full(self):
+        self._log("Limpieza completa en curso...", "info")
+        def work():
+            t = Cleaner.clean_temp()
+            b = Cleaner.clean_browser_cache()
+            d = DeepCleaner.clean_directx_shaders()
+            p = Cleaner.clean_prefetch()
+            r = Cleaner.clean_recycle_bin()
+            return t, b, d, p, r
+        def done(res):
+            self._log(
+                f"Limpieza completa → TEMP:{res[0]} · Navegadores:{res[1]} · "
+                f"Shaders:{res[2]} · Prefetch:{res[3]} · {res[4]}", "ok")
+        self._run_async(work, done)
 
-        if opt == "1":
-            ok, msg = PerformanceTweaks.enable_ultimate_performance()
-            console.print(f"[bold]{msg}[/bold]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "2":
-            with console.status("[bold cyan]Enviando comando TRIM al SSD..."):
-                ok, msg = PerformanceTweaks.run_trim_ssd()
-            console.print(f"[bold]{msg}[/bold]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "3":
-            ok, msg = PerformanceTweaks.optimize_tcp_stack()
-            console.print(f"[bold]{msg}[/bold]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "4":
-            with console.status("[bold yellow]Comprobando archivos de sistema (puede tardar unos minutos)..."):
-                msg = SystemRepairManager.run_sfc_scan()
-            console.print(f"[bold]{msg}[/bold]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "5":
-            with console.status("[bold yellow]Descargando y reparando componentes dañados de Windows..."):
-                msg = SystemRepairManager.run_dism_restore()
-            console.print(f"[bold]{msg}[/bold]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "6":
-            disks = SystemRepairManager.check_smart_disks()
+    # =====================================================
+    # PAGE: PERFORMANCE
+    # =====================================================
+    def _page_perf(self):
+        frame = ctk.CTkScrollableFrame(self.page_container, corner_radius=0)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        self._page_header(
+            frame, "Rendimiento & Reparación",
+            "Ajustes que mejoran velocidad, salud del disco y del sistema.",
+            "Las acciones de reparación (SFC, DISM) requieren Administrador "
+            "y pueden tardar varios minutos.")
+
+        self._action_card(frame, "Plan de Energía Máximo Rendimiento",
+            "Desbloquea el plan Ultimate de Windows. Solo en Win10/11 Pro.",
+            self._act_perf_ultimate, "⚡")
+        self._action_card(frame, "TRIM / Optimización SSD",
+            "Envía TRIM al disco C: (equivalente al 'Optimizar' de Windows).",
+            self._act_perf_trim, "💾")
+        self._action_card(frame, "Optimizar Pila TCP",
+            "Ajusta el auto-tuning TCP al modo recomendado por Microsoft.",
+            self._act_perf_tcp, "🌐")
+        self._action_card(frame, "Comprobar Integridad (SFC /scannow)",
+            "Verifica y repara archivos dañados de Windows. Tarda minutos.",
+            self._act_perf_sfc, "🔧")
+        self._action_card(frame, "Reparar Imagen Windows (DISM)",
+            "RestoreHealth: repara componentes del sistema. Requiere conexión.",
+            self._act_perf_dism, "🛠")
+        self._action_card(frame, "Diagnóstico S.M.A.R.T. de Discos",
+            "Muestra el estado de salud reportado por el hardware.",
+            self._act_perf_smart, "📊")
+        self._action_card(frame, "Desactivar Telemetría de Windows",
+            "Detiene servicios de rastreo (DiagTrack y compañía).",
+            self._act_perf_telemetry, "🕵")
+
+    def _act_perf_ultimate(self):
+        self._log("Activando plan Ultimate...", "info")
+        self._run_async(PerformanceTweaks.enable_ultimate_performance,
+            lambda r: self._log(str(r[1]), "ok" if r[0] else "warn"))
+
+    def _act_perf_trim(self):
+        self._log("Enviando TRIM...", "info")
+        self._run_async(PerformanceTweaks.run_trim_ssd,
+            lambda r: self._log(str(r[1]), "ok" if r[0] else "warn"))
+
+    def _act_perf_tcp(self):
+        self._log("Optimizando TCP...", "info")
+        self._run_async(PerformanceTweaks.optimize_tcp,
+            lambda r: self._log(str(r[1]), "ok" if r[0] else "warn"))
+
+    def _act_perf_sfc(self):
+        self._log("Ejecutando SFC /scannow (puede tardar varios minutos)...", "info")
+        self._run_async(RepairManager.run_sfc,
+            lambda r: self._log(str(r), "ok"))
+
+    def _act_perf_dism(self):
+        self._log("Ejecutando DISM RestoreHealth (puede tardar)...", "info")
+        self._run_async(RepairManager.run_dism_restore,
+            lambda r: self._log(str(r), "ok"))
+
+    def _act_perf_smart(self):
+        self._log("Consultando S.M.A.R.T....", "info")
+        def work():
+            disks = RepairManager.check_smart()
             if not disks:
-                console.print("[yellow]No se pudo leer la información S.M.A.R.T. o no estás en Windows.[/yellow]")
-            else:
-                table = Table(title="Estado S.M.A.R.T. de Discos", box=box.SIMPLE)
-                table.add_column("Disco", style="bold white")
-                table.add_column("Tipo", style="cyan")
-                table.add_column("Salud", style="bold green")
-                table.add_column("Estado", style="magenta")
-                for d in disks:
-                    table.add_row(str(d.get("FriendlyName")), str(d.get("MediaType")), str(d.get("HealthStatus")), str(d.get("OperationalStatus")))
-                console.print(table)
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "7":
-            ok, msg = PrivacyAndUninstallManager.disable_telemetry()
-            console.print(f"[bold]{msg}[/bold]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "0":
-            break
+                return "No se pudo obtener información S.M.A.R.T."
+            lines = [f"{'Disco':<30} {'Tipo':<10} {'Salud':<12} Estado"]
+            lines.append("-" * 80)
+            for d in disks:
+                lines.append(
+                    f"{str(d.get('FriendlyName','?'))[:28]:<30} "
+                    f"{str(d.get('MediaType','?')):<10} "
+                    f"{str(d.get('HealthStatus','?')):<12} "
+                    f"{str(d.get('OperationalStatus','?'))}")
+            return "\n".join(lines)
+        self._run_async(work, lambda r: self._log(r, "ok"))
 
+    def _act_perf_telemetry(self):
+        self._log("Desactivando telemetría...", "info")
+        self._run_async(PerformanceTweaks.disable_telemetry,
+            lambda r: self._log(str(r[1]), "ok" if r[0] else "warn"))
 
-def programs_and_startup_menu():
-    while True:
-        console.clear()
-        console.print(Panel("[bold cyan]GESTIÓN DE PROGRAMAS & INICIO[/bold cyan]", box=box.ROUNDED))
-        console.print("[1] Ver Programas que Inician con Windows")
-        console.print("[2] Desactivar un Programa del Inicio")
-        console.print("[3] Desinstalar Aplicaciones Instaladas")
-        console.print("[0] Volver\n")
+    # =====================================================
+    # PAGE: PROGRAMS
+    # =====================================================
+    def _page_programs(self):
+        frame = ctk.CTkScrollableFrame(self.page_container, corner_radius=0)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-        opt = Prompt.ask("[bold yellow]Seleccione una opción[/bold yellow]", default="0")
+        self._page_header(
+            frame, "Programas & Arranque",
+            "Gestiona qué se inicia con Windows y desinstala aplicaciones.",
+            "El inicio automático afecta al tiempo de arranque. "
+            "Para desinstalar solo debes elegir el programa de la lista.")
 
-        if opt == "1":
-            apps = StartupManager.get_startup_apps()
+        self._action_card(frame, "Ver Programas que Inician con Windows",
+            "Lista entradas de arranque de Usuario y Sistema.",
+            self._act_prog_list_startup, "🚀")
+        self._action_card(frame, "Quitar Programa del Inicio",
+            "Elimina una entrada de arranque por nombre.",
+            self._act_prog_remove_startup, "❌")
+        self._action_card(frame, "Desinstalar Aplicaciones",
+            "Muestra la lista de programas instalados y ejecuta su desinstalador.",
+            self._act_prog_uninstall, "📦")
+
+    def _act_prog_list_startup(self):
+        self._log("Consultando programas de inicio...", "info")
+        def work():
+            apps = AppManager.get_startup_apps()
             if not apps:
-                console.print("[yellow]No se encontraron programas de inicio o no estás en Windows.[/yellow]")
-            else:
-                table = Table(title="Programas de Arranque", box=box.SIMPLE)
-                table.add_column("Nombre", style="bold cyan")
-                table.add_column("Ámbito", style="magenta")
-                table.add_column("Comando", style="dim")
-                for a in apps:
-                    table.add_row(a["name"], a["scope"], a["command"])
-                console.print(table)
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "2":
-            name = Prompt.ask("Nombre exacto del programa a quitar del inicio")
-            scope = Prompt.ask("Ámbito (1: Usuario Actual, 2: Todo el Sistema)", default="1")
-            sc_val = "Usuario Actual" if scope == "1" else "Todo el Sistema"
-            ok, msg = StartupManager.remove_startup_app(name, sc_val)
-            console.print(f"[bold]{msg}[/bold]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "3":
-            apps = PrivacyAndUninstallManager.get_installed_apps()
+                return "No se encontraron entradas de inicio."
+            lines = [f"{'Ámbito':<10} {'Nombre':<30} Comando"]
+            lines.append("-" * 90)
+            for a in apps:
+                lines.append(
+                    f"{a['scope']:<10} {a['name'][:28]:<30} {a['cmd'][:40]}")
+            return "\n".join(lines)
+        self._run_async(work, lambda r: self._log(r, "ok"))
+
+    def _act_prog_remove_startup(self):
+        name = simpledialog.askstring(
+            "Quitar del inicio", "Nombre exacto de la entrada:", parent=self)
+        if not name:
+            return
+        scope = simpledialog.askstring(
+            "Ámbito", "Escribe 'Usuario' o 'Sistema':",
+            initialvalue="Usuario", parent=self) or "Usuario"
+        self._run_async(
+            lambda: AppManager.remove_startup(name, scope.strip()),
+            lambda r: self._log(str(r[1]), "ok" if r[0] else "warn"))
+
+    def _act_prog_uninstall(self):
+        self._log("Cargando programas instalados...", "info")
+        def work():
+            apps = AppManager.get_installed_apps()
+            return apps[:50]
+        def done(apps):
             if not apps:
-                console.print("[yellow]No se pudieron listar las aplicaciones instaladas.[/yellow]")
-            else:
-                table = Table(title="Aplicaciones Detectadas", box=box.SIMPLE)
-                table.add_column("ID", style="dim")
-                table.add_column("Nombre del Programa", style="bold white")
-                for idx, app in enumerate(apps[:25], 1):
-                    table.add_row(str(idx), app["name"])
-                console.print(table)
-                sel = Prompt.ask("\nIntroduce el ID para desinstalar (o 0 para cancelar)", default="0")
-                if sel.isdigit() and 1 <= int(sel) <= len(apps[:25]):
-                    target = apps[int(sel) - 1]
-                    ok, msg = PrivacyAndUninstallManager.uninstall_app(target["cmd"])
-                    console.print(f"[bold]{msg}[/bold]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "0":
-            break
+                self._log("No se encontraron aplicaciones.", "warn")
+                return
+            names = [f"{i+1}. {a['name']}" for i, a in enumerate(apps)]
+            text = "\n".join(names)
+            self._log(text, "ok")
+            idx = simpledialog.askinteger(
+                "Desinstalar",
+                f"Selecciona número (1-{len(apps)}):",
+                minvalue=1, maxvalue=len(apps), parent=self)
+            if idx:
+                target = apps[idx - 1]
+                ok, msg = AppManager.uninstall(target["cmd"])
+                self._log(str(msg), "ok" if ok else "warn")
+        self._run_async(work, done)
 
+    # =====================================================
+    # PAGE: RAM
+    # =====================================================
+    def _page_ram(self):
+        frame = ctk.CTkScrollableFrame(self.page_container, corner_radius=0)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-def network_menu():
-    while True:
-        console.clear()
-        console.print(Panel("[bold cyan]RED & OPTIMIZACIÓN DE CONEXIÓN[/bold cyan]", box=box.ROUNDED))
-        console.print("[1] Diagnóstico de IPs y Latencia")
-        console.print("[2] Asignar DNS Rápidos de Cloudflare (1.1.1.1)")
-        console.print("[3] Vaciar Caché DNS (Flush DNS)")
-        console.print("[4] Test de Velocidad (SpeedTest)")
-        console.print("[0] Volver\n")
+        self._page_header(
+            frame, "Memoria RAM",
+            "Analiza y libera memoria de forma REAL (no placebo).",
+            "La optimización combina 3 técnicas: recorte de working sets + "
+            "purgado de la Standby List + limpieza del File Cache. "
+            "Requiere Administrador para el efecto completo.")
 
-        opt = Prompt.ask("[bold yellow]Seleccione una opción[/bold yellow]", default="0")
+        # Live metrics
+        self.ram_cards = ctk.CTkFrame(frame, fg_color="transparent")
+        self.ram_cards.pack(fill="x", pady=(0, 16))
+        self.ram_cards.grid_columnconfigure((0, 1), weight=1)
+        self.ram_phys_card = self._metric_card(self.ram_cards, "RAM Física", 0, "🧠")
+        self.ram_swap_card = self._metric_card(self.ram_cards, "Swap", 1, "💽")
 
-        if opt == "1":
-            console.print(f"IP Local: [cyan]{NetworkManager.get_local_ip()}[/cyan]")
-            console.print(f"IP Pública: [cyan]{NetworkManager.get_public_ip()}[/cyan]")
-            console.print(f"Ping Google (8.8.8.8): [green]{NetworkManager.ping_host('8.8.8.8')} ms[/green]")
-            console.print(f"Ping Cloudflare (1.1.1.1): [green]{NetworkManager.ping_host('1.1.1.1')} ms[/green]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "2":
-            adapter = Prompt.ask("Nombre del adaptador", default="Wi-Fi")
-            ok, msg = NetworkManager.set_fast_dns(adapter)
-            console.print(f"[bold]{msg}[/bold]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "3":
-            ok = NetworkManager.flush_dns()
-            console.print("[green]Caché DNS vaciada.[/green]" if ok else "[red]Error al vaciar DNS.[/red]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "4":
-            with console.status("[bold cyan]Midiendo ancho de banda..."):
-                res = NetworkManager.speed_test()
-            if res["success"]:
-                console.print(f"[green]Descarga:[/green] {res['download']} Mbps | [green]Subida:[/green] {res['upload']} Mbps | [cyan]Ping:[/cyan] {res['ping']} ms")
-            else:
-                console.print(f"[red]Error:[/red] {res['error']}")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "0":
-            break
+        self._action_card(frame, "Top 15 Procesos por RAM",
+            "Lista los procesos que más memoria consumen con uso en MB.",
+            self._act_ram_top, "📊")
+        self._action_card(frame, "Optimizar RAM (REAL)",
+            "Recorta working sets + purga standby list + limpia file cache.",
+            self._act_ram_optimize, "✨")
+        self._action_card(frame, "Terminar Proceso por PID",
+            "Pide el PID y cierra ese proceso.",
+            self._act_ram_kill, "❌")
+        self._action_card(frame, "Diagnóstico de Presión de Memoria",
+            "Analiza Swap vs RAM total para detectar saturación.",
+            self._act_ram_diag, "🩺")
 
+        self._refresh_ram_metrics()
 
-def ai_hub_menu():
-    while True:
-        console.clear()
-        console.print(Panel("[bold cyan]AI HUB & DIAGNÓSTICO INTELIGENTE[/bold cyan]", box=box.ROUNDED))
-        console.print("[1] Ver Proveedores Registrados")
-        console.print("[2] Vincular API Key de Gemini (Autodetección)")
-        console.print("[3] Solicitar Diagnóstico IA del Equipo")
-        console.print("[4] Eliminar Proveedor")
-        console.print("[0] Volver\n")
+    def _refresh_ram_metrics(self):
+        if self.current_page != "ram":
+            return
+        try:
+            mem = psutil.virtual_memory()
+            swap = psutil.swap_memory()
+            for card, pct, sub in [
+                (self.ram_phys_card, mem.percent,
+                 f"{round(mem.available/(1024**3),2)} GB libres de {round(mem.total/(1024**3),2)} GB"),
+                (self.ram_swap_card, swap.percent,
+                 f"{round(swap.free/(1024**3),2)} GB libres de {round(swap.total/(1024**3),2)} GB"),
+            ]:
+                color = "#22c55e" if pct < 60 else ("#f59e0b" if pct <= 80 else "#ef4444")
+                card["value"].configure(text=f"{pct:.1f}%", text_color=color)
+                card["bar"].configure(progress_color=color)
+                card["bar"].set(pct / 100)
+                card["sub"].configure(text=sub)
+        except Exception:
+            pass
+        self.after(2000, self._refresh_ram_metrics)
 
-        opt = Prompt.ask("[bold yellow]Seleccione una opción[/bold yellow]", default="0")
-
-        if opt == "1":
-            for p in AIProviderManager.get_all():
-                st = "[green]ACTIVO[/green]" if p.get("enabled") else "[red]INACTIVO[/red]"
-                console.print(f"- {p['name']} [{st}] | Modelo: [cyan]{p.get('detected_model') or p.get('model')}[/cyan]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "2":
-            key = Prompt.ask("Pega tu API Key de Gemini")
-            with console.status("[bold cyan]Validando credenciales con Google..."):
-                ok, model = AIValidator.auto_detect_and_bind("Gemini", key)
-            if ok:
-                AIProviderManager.add_provider("Gemini", key, model=model)
-                console.print(f"\n[green]Éxito:[/green] API Key vinculada y funcionando con [bold cyan]{model}[/bold cyan]")
-            else:
-                AIProviderManager.add_provider("Gemini", key)
-                console.print(f"\n[yellow]Aviso:[/yellow] {model}")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "3":
-            with console.status("[bold green]Generando informe con LLM..."):
-                info = SystemInfo.get_info()
-                summary = f"OS: {info['os']}, CPU: {info['cpu_usage']}%, RAM: {info['ram_usage']}%, Disco: {info['disk_usage']}%"
-                report = AIValidator.diagnose_system(summary)
-            console.print(Panel(report, title="[bold cyan]Dictamen Técnico IA[/bold cyan]", box=box.ROUNDED))
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "4":
-            name = Prompt.ask("Nombre del proveedor a eliminar")
-            AIProviderManager.remove_provider(name)
-            console.print("[red]Proveedor eliminado.[/red]")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "0":
-            break
-
-
-# =========================================================
-# DASHBOARD UI (menú principal)
-# =========================================================
-
-def _usage_color(percent):
-    pct = float(percent or 0)
-    if pct < 60:
-        return "green"
-    if pct <= 80:
-        return "yellow"
-    return "red"
-
-
-def _usage_bar(percent, width=24):
-    pct = max(0.0, min(100.0, float(percent or 0)))
-    color = _usage_color(pct)
-    return ProgressBar(
-        total=100,
-        completed=pct,
-        width=width,
-        complete_style=color,
-        finished_style=color,
-        pulse_style="cyan",
-    )
-
-
-BANNER_ASCII = r"""
-    _ __   __ _____ _____  ___    ___
-   / \\ \ / /|_ _/ _  / _ \  | _ \ 
-  / _ \\ V /  | || (_) |   /  |   /
- /_/ \_\\_/  |___|\___/|_|_\  |_|_\
-"""
-
-def render_main_dashboard(info, health):
-    admin_txt = (
-        "[bold green]ADMIN[/bold green]"
-        if info["is_admin"]
-        else "[bold yellow]USUARIO[/bold yellow]"
-    )
-    banner = Text(BANNER_ASCII, style="bold cyan", justify="center")
-    subtitle = Text.from_markup(
-        f"[bold white]CLEANER PRO[/bold white]  [dim]v1.3[/dim]   {admin_txt}",
-        justify="center",
-    )
-
-    metrics = Table(box=None, expand=True, pad_edge=False, show_header=False)
-    metrics.add_column("label", style="bold cyan", width=8)
-    metrics.add_column("bar", ratio=1)
-    metrics.add_column("value", justify="right", width=22)
-
-    metrics.add_row(
-        "CPU",
-        _usage_bar(info["cpu_usage"]),
-        f"[{_usage_color(info['cpu_usage'])}]{info['cpu_usage']:>5.1f}%[/]",
-    )
-    metrics.add_row(
-        "RAM",
-        _usage_bar(info["ram_usage"]),
-        f"[{_usage_color(info['ram_usage'])}]{info['ram_usage']:>5.1f}%[/]  "
-        f"[dim]{info['ram_free_gb']} GB libres[/dim]",
-    )
-    metrics.add_row(
-        "DISCO",
-        _usage_bar(info["disk_usage"]),
-        f"[{_usage_color(info['disk_usage'])}]{info['disk_usage']:>5.1f}%[/]  "
-        f"[dim]{info['disk_free_gb']} GB libres[/dim]",
-    )
-
-    meta = Table(box=None, expand=True, show_header=False)
-    meta.add_column(justify="left")
-    meta.add_column(justify="right")
-    meta.add_row(
-        f"[white]Host[/white] [cyan]{info['hostname']}[/cyan]  [dim]{info['os']}[/dim]",
-        f"[white]Salud[/white] [{health['color']}]{health['score']}/100 {health['status']}[/]",
-    )
-    meta.add_row(
-        f"[white]IP publica[/white] [cyan]{NetworkManager.get_public_ip()}[/cyan]",
-        f"[dim]{info['timestamp']}[/dim]",
-    )
-
-    header = Panel(
-        Group(banner, subtitle, Text(""), meta, Text(""), metrics),
-        title="[bold cyan]AVIZOR CLEANER[/bold cyan]",
-        subtitle="[dim cyan]dashboard de mantenimiento Windows[/dim cyan]",
-        border_style="cyan",
-        box=box.ROUNDED,
-        style="on #0b1220",
-        padding=(0, 2),
-    )
-
-    items = [
-        ("1", "[*]", "Limpieza", "TEMP, navegadores y Windows Update"),
-        ("2", "[+]", "Rendimiento", "SSD TRIM, SFC y hardware"),
-        ("3", "[#]", "Programas", "Desinstalador e inicio"),
-        ("4", "[$]", "Memoria RAM", "Submenu avanzado y procesos"),
-        ("5", "[@]", "Red y DNS", "Latencia y Cloudflare"),
-        ("6", "[&]", "AI Hub", "Autovinculacion y diagnostico LLM"),
-        ("7", "[%]", "Informe JSON", "Exportar reporte del sistema"),
-        ("0", "[X]", "Salir", "Cerrar aplicacion"),
-    ]
-
-    menu = Table(
-        box=box.ROUNDED,
-        expand=True,
-        show_header=True,
-        header_style="bold cyan",
-        border_style="blue",
-        style="on #0b1220",
-    )
-    menu.add_column("Op", justify="center", style="bold yellow", width=4)
-    menu.add_column("", justify="center", style="bold magenta", width=5)
-    menu.add_column("Modulo", style="bold white", width=16)
-    menu.add_column("Descripcion", style="dim white")
-
-    for key, icon, name, desc in items:
-        menu.add_row(key, icon, name, desc)
-
-    dashboard = Group(header, Text(""), menu)
-    return Align.center(dashboard, width=86)
-def render_main_dashboard(info, health):
-    admin_txt = (
-        "[bold green]ADMIN[/bold green]"
-        if info["is_admin"]
-        else "[bold yellow]USUARIO[/bold yellow]"
-    )
-    banner = Text(BANNER_ASCII, style="bold cyan", justify="center")
-    subtitle = Text.from_markup(
-        f"[bold white]CLEANER PRO[/bold white]  [dim]v1.3[/dim]   {admin_txt}",
-        justify="center",
-    )
-
-    metrics = Table(box=None, expand=True, pad_edge=False, show_header=False)
-    metrics.add_column("label", style="bold cyan", width=8)
-    metrics.add_column("bar", ratio=1)
-    metrics.add_column("value", justify="right", width=22)
-
-    metrics.add_row(
-        "CPU",
-        _usage_bar(info["cpu_usage"]),
-        f"[{_usage_color(info['cpu_usage'])}]{info['cpu_usage']:>5.1f}%[/]",
-    )
-    metrics.add_row(
-        "RAM",
-        _usage_bar(info["ram_usage"]),
-        f"[{_usage_color(info['ram_usage'])}]{info['ram_usage']:>5.1f}%[/]  "
-        f"[dim]{info['ram_free_gb']} GB libres[/dim]",
-    )
-    metrics.add_row(
-        "DISCO",
-        _usage_bar(info["disk_usage"]),
-        f"[{_usage_color(info['disk_usage'])}]{info['disk_usage']:>5.1f}%[/]  "
-        f"[dim]{info['disk_free_gb']} GB libres[/dim]",
-    )
-
-    meta = Table(box=None, expand=True, show_header=False)
-    meta.add_column(justify="left")
-    meta.add_column(justify="right")
-    meta.add_row(
-        f"[white]Host[/white] [cyan]{info['hostname']}[/cyan]  [dim]{info['os']}[/dim]",
-        f"[white]Salud[/white] [{health['color']}]{health['score']}/100 {health['status']}[/]",
-    )
-    meta.add_row(
-        f"[white]IP pública[/white] [cyan]{NetworkManager.get_public_ip()}[/cyan]",
-        f"[dim]{info['timestamp']}[/dim]",
-    )
-
-    header = Panel(
-        Group(Align.center(banner), Align.center(subtitle), Text(""), meta, Text(""), metrics),
-        title="[bold cyan]◆ AVIZOR[/bold cyan]",
-        subtitle="[dim cyan]dashboard de mantenimiento Windows[/dim cyan]",
-        border_style="cyan",
-        box=box.ROUNDED,
-        style="on #0b1220",
-        padding=(0, 1),
-    )
-
-    items = [
-        ("1", "◆", "Limpieza", "TEMP, navegadores y Windows Update"),
-        ("2", "⚡", "Rendimiento", "SSD TRIM, SFC y hardware"),
-        ("3", "▣", "Programas", "Desinstalador e inicio"),
-        ("4", "▦", "Memoria RAM", "Compactar procesos"),
-        ("5", "◈", "Red y DNS", "Latencia y Cloudflare"),
-        ("6", "✦", "AI Hub", "Autovinculación y diagnóstico LLM"),
-        ("7", "▤", "Informe JSON", "Exportar reporte del sistema"),
-    ]
-
-    menu = Table(
-        box=box.ROUNDED,
-        expand=True,
-        show_header=True,
-        header_style="bold cyan",
-        border_style="blue",
-        style="on #0b1220",
-        pad_edge=True,
-    )
-    menu.add_column("Opción", width=10, justify="center")
-    menu.add_column("Módulo", ratio=1)
-    menu.add_column("Opción", width=10, justify="center")
-    menu.add_column("Módulo", ratio=1)
-
-    for i in range(0, 6, 2):
-        a, b = items[i], items[i + 1]
-        menu.add_row(
-            f"[bold yellow][{a[0]}][/bold yellow] {a[1]}",
-            f"[bold white]{a[2]}[/bold white]\n[dim]{a[3]}[/dim]",
-            f"[bold yellow][{b[0]}][/bold yellow] {b[1]}",
-            f"[bold white]{b[2]}[/bold white]\n[dim]{b[3]}[/dim]",
-        )
-    last = items[6]
-    menu.add_row(
-        f"[bold yellow][{last[0]}][/bold yellow] {last[1]}",
-        f"[bold white]{last[2]}[/bold white]\n[dim]{last[3]}[/dim]",
-        "[bold yellow][0][/bold yellow] ✕",
-        "[bold white]Salir[/bold white]\n[dim]Cerrar AvizorCleaner[/dim]",
-    )
-
-    console.print(header)
-    console.print()
-    console.print(menu)
-
-# =========================================================
-# MAIN APP & RAM ADVANCED MENU
-# =========================================================
-
-def ram_advanced_menu():
-    while True:
-        console.clear()
-        mem = psutil.virtual_memory()
-        swap = psutil.swap_memory()
-
-        mem_tbl = Table(
-            box=box.ROUNDED,
-            expand=True,
-            title="[bold cyan]ESTADO DE MEMORIA[/bold cyan]",
-            border_style="cyan"
-        )
-        mem_tbl.add_column("Métrica", style="bold white")
-        mem_tbl.add_column("Uso / Total", justify="right", style="cyan")
-        mem_tbl.add_column("Libre", justify="right", style="green")
-        mem_tbl.add_column("Estado", justify="center")
-
-        mem_tbl.add_row(
-            "RAM Física",
-            f"{mem.percent}% ({round(mem.used/(1024**3), 2)}/{round(mem.total/(1024**3), 2)} GB)",
-            f"{round(mem.available/(1024**3), 2)} GB",
-            f"[{_usage_color(mem.percent)}]{mem.percent}%[/]"
-        )
-        mem_tbl.add_row(
-            "Archivo Swap",
-            f"{swap.percent}% ({round(swap.used/(1024**3), 2)}/{round(swap.total/(1024**3), 2)} GB)",
-            f"{round(swap.free/(1024**3), 2)} GB",
-            f"[{_usage_color(swap.percent)}]{swap.percent}%[/]"
-        )
-
-        menu_tbl = Table(
-            box=box.ROUNDED,
-            expand=True,
-            title="[bold cyan]GESTIÓN AVANZADA DE MEMORIA[/bold cyan]",
-            border_style="blue"
-        )
-        menu_tbl.add_column("Op", justify="center", style="bold yellow", width=4)
-        menu_tbl.add_column("Acción", style="bold white", width=26)
-        menu_tbl.add_column("Descripción", style="dim white")
-
-        menu_tbl.add_row("1", "Top 15 Procesos por RAM", "Listar mayores consumidores con uso en MB")
-        menu_tbl.add_row("2", "Compactar Working Sets", "Liberar páginas de memoria al sistema operativo")
-        menu_tbl.add_row("3", "Terminar Proceso por PID", "Forzar cierre selectivo de procesos pesados")
-        menu_tbl.add_row("4", "Purgar Caché .NET / Memoria", "Forzar recolección de memoria residual")
-        menu_tbl.add_row("5", "Monitoreo en Tiempo Real", "Seguimiento dinámico de consumo durante 10s")
-        menu_tbl.add_row("6", "Diagnóstico Completo", "Analizar presión de memoria y saturación de Swap")
-        menu_tbl.add_row("0", "Volver", "Regresar al panel principal")
-
-        console.print(Align.center(Group(mem_tbl, Text(""), menu_tbl), width=86))
-        sub_opt = Prompt.ask("\n> Seleccione una opción", default="0")
-
-        if sub_opt == "0":
-            break
-        elif sub_opt == "1":
+    def _act_ram_top(self):
+        self._log("Cargando top 15 procesos por RAM...", "info")
+        def work():
             procs = []
-            for p in psutil.process_iter(['pid', 'name', 'memory_info']):
+            for p in psutil.process_iter(["pid", "name", "memory_info"]):
                 try:
-                    procs.append((p.info['pid'], p.info['name'], p.info['memory_info'].rss))
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    procs.append((p.info["pid"], p.info["name"],
+                                  p.info["memory_info"].rss))
+                except Exception:
                     pass
             procs.sort(key=lambda x: x[2], reverse=True)
-            tbl = Table(title="Top 15 Consumidores de RAM", box=box.ROUNDED)
-            tbl.add_column("PID", style="cyan")
-            tbl.add_column("Nombre", style="bold white")
-            tbl.add_column("Memoria (MB)", justify="right", style="green")
+            lines = [f"{'PID':<8} {'Nombre':<32} {'RAM':>10}"]
+            lines.append("-" * 55)
             for pid, name, rss in procs[:15]:
-                tbl.add_row(str(pid), name, f"{round(rss / (1024*1024), 2)} MB")
-            console.print(tbl)
-            Prompt.ask("\nPresione Enter para volver")
-        elif sub_opt == "2":
-            with console.status("[bold green]Compactando memoria..."):
-                before = psutil.virtual_memory().available
-                count = ProcessManager.optimize_ram()
-                after = psutil.virtual_memory().available
-                freed = max(0, round((after - before) / (1024 * 1024), 2))
-            console.print(f"\n[green]Memoria compactada en {count} procesos. Liberados: {freed} MB.[/green]")
-            Prompt.ask("\nPresione Enter para volver")
-        elif sub_opt == "3":
-            pid_in = Prompt.ask("Ingrese el PID del proceso a terminar")
-            if pid_in.isdigit():
-                try:
-                    p = psutil.Process(int(pid_in))
-                    name = p.name()
-                    p.terminate()
-                    console.print(f"[green]Proceso {name} ({pid_in}) finalizado correctamente.[/green]")
-                except Exception as e:
-                    console.print(f"[red]Error al finalizar proceso: {e}[/red]")
-            Prompt.ask("\nPresione Enter para volver")
-        elif sub_opt == "4":
-            with console.status("[bold green]Purgando memoria residual..."):
-                subprocess.run(
-                    ["powershell", "-Command", "[System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()"],
-                    capture_output=True
-                )
-            console.print("[green]Caché de memoria recolectada con éxito.[/green]")
-            Prompt.ask("\nPresione Enter para volver")
-        elif sub_opt == "5":
-            console.print("[cyan]Monitoreando cada 1s durante 10s (Ctrl+C para cancelar)...[/cyan]")
+                lines.append(f"{pid:<8} {str(name)[:30]:<32} "
+                             f"{round(rss/(1024*1024),2):>8} MB")
+            return "\n".join(lines)
+        self._run_async(work, lambda r: self._log(r, "ok"))
+
+    def _act_ram_optimize(self):
+        self._log("Aplicando optimización REAL de RAM...", "info")
+        def work():
+            return optimize_ram_real()
+        def done(res):
+            lines = [
+                f"Procesos recortados: {res['trimmed']}",
+                f"Standby List purgada: {'Sí' if res['standby'] else 'No (admin)'}",
+                f"File cache limpiado:  {'Sí' if res['filecache'] else 'No (admin)'}",
+                f"RAM usada antes:      {res['before_gb']} GB",
+                f"RAM usada después:    {res['after_gb']} GB",
+                f"RAM liberada:         {res['freed_mb']} MB",
+            ]
+            if res["needs_admin"]:
+                lines.append("")
+                lines.append("⚠️  Ejecuta como Administrador para el efecto completo.")
+            self._log("\n".join(lines), "ok")
+            self._refresh_ram_metrics()
+        self._run_async(work, done)
+
+    def _act_ram_kill(self):
+        pid = simpledialog.askinteger("Terminar proceso", "PID:", parent=self)
+        if not pid:
+            return
+        self._log(f"Terminando PID {pid}...", "info")
+        def work():
             try:
-                for _ in range(10):
-                    m = psutil.virtual_memory()
-                    console.print(f"Uso RAM: [bold cyan]{m.percent}%[/] | Libre: [green]{round(m.available/(1024**3), 2)} GB[/]")
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                pass
-            Prompt.ask("\nPresione Enter para volver")
-        elif sub_opt == "6":
-            swap_alert = "[bold red]ALTO (Riesgo de lentitud)[/]" if swap.percent > 75 else "[green]NORMAL[/]"
-            diag_panel = Panel(
-                f"RAM Total: {round(mem.total/(1024**3), 2)} GB\n"
-                f"RAM Usada: {round(mem.used/(1024**3), 2)} GB\n"
-                f"Swap Usado: {round(swap.used/(1024**3), 2)} GB ({swap.percent}%)\n"
-                f"Diagnóstico Swap: {swap_alert}",
-                title="Diagnóstico de Presión de Memoria",
-                box=box.ROUNDED,
-                border_style="yellow"
-            )
-            console.print(diag_panel)
-            Prompt.ask("\nPresione Enter para volver")
-
-
-def main():
-    init_portable_files()
-    request_admin_elevation()
-
-    while True:
-        console.clear()
-        info = SystemInfo.get_info()
-        health = AdvancedHealthAnalyzer.calculate(info)
-        render_main_dashboard(info, health)
-
-        opt = Prompt.ask("[bold cyan]   › Seleccione una opción[/bold cyan]", default="0")
-
-        if opt == "1":
-            cleaner_menu()
-        elif opt == "2":
-            performance_and_repair_menu()
-        elif opt == "3":
-            programs_and_startup_menu()
-        elif opt == "4":
-            ram_advanced_menu()
-        elif opt == "5":
-            network_menu()
-        elif opt == "6":
-            ai_hub_menu()
-        elif opt == "7":
-            try:
-                with console.status("[bold cyan]Exportando informe..."):
-                    p = ReportGenerator.generate_full_report()
-                console.print(f"\n[green]Reporte generado en:[/green] {p}")
+                p = psutil.Process(pid)
+                name = p.name()
+                p.terminate()
+                return True, f"Proceso {name} ({pid}) finalizado."
             except Exception as e:
-                console.print(f"\n[red]No se pudo generar el reporte:[/red] {e}")
-            Prompt.ask("\nPresione Enter para continuar")
-        elif opt == "0":
-            console.print("\n[bold cyan]Cerrando AvizorCleaner.[/bold cyan]")
-            sys.exit(0)
+                return False, str(e)
+        self._run_async(work,
+            lambda r: self._log(r[1], "ok" if r[0] else "err"))
+
+    def _act_ram_diag(self):
+        mem = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        alert = "⚠️ ALTO — Riesgo de lentitud" if swap.percent > 75 else "✓ NORMAL"
+        msg = (
+            f"RAM Total:      {round(mem.total/(1024**3),2)} GB\n"
+            f"RAM Usada:      {round(mem.used/(1024**3),2)} GB ({mem.percent}%)\n"
+            f"Swap Total:     {round(swap.total/(1024**3),2)} GB\n"
+            f"Swap Usado:     {round(swap.used/(1024**3),2)} GB ({swap.percent}%)\n"
+            f"\nDiagnóstico Swap: {alert}"
+        )
+        self._log(msg, "ok" if swap.percent <= 75 else "warn")
+
+    # =====================================================
+    # PAGE: NETWORK
+    # =====================================================
+    def _page_network(self):
+        frame = ctk.CTkScrollableFrame(self.page_container, corner_radius=0)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        self._page_header(
+            frame, "Red & DNS",
+            "Diagnóstico de conexión y ajustes de DNS.",
+            "Cambiar a DNS de Cloudflare (1.1.1.1) suele mejorar la resolución "
+            "de dominios. Requiere Administrador.")
+
+        self._action_card(frame, "Diagnóstico de IPs y Latencia",
+            "Muestra IP local, IP pública y ping a Google/Cloudflare.",
+            self._act_net_diag, "🔍")
+        self._action_card(frame, "Vaciar Caché DNS",
+            "Limpia la caché local (útil tras cambiar DNS).",
+            self._act_net_flush, "🧹")
+        self._action_card(frame, "Asignar DNS Rápidos (Cloudflare)",
+            "Configura 1.1.1.1 / 1.0.0.1 en el adaptador elegido.",
+            self._act_net_dns, "⚡")
+        self._action_card(frame, "Test de Velocidad (Speedtest)",
+            "Mide descarga, subida y ping. Tarda ~30s.",
+            self._act_net_speed, "📶")
+
+    def _act_net_diag(self):
+        self._log("Consultando IPs y latencia...", "info")
+        def work():
+            return (
+                NetworkManager.get_local_ip(),
+                NetworkManager.get_public_ip(),
+                NetworkManager.ping("8.8.8.8"),
+                NetworkManager.ping("1.1.1.1"),
+            )
+        def done(r):
+            self._log(
+                f"IP Local:  {r[0]}\n"
+                f"IP Pública: {r[1]}\n"
+                f"Ping Google (8.8.8.8):    {r[2]} ms\n"
+                f"Ping Cloudflare (1.1.1.1): {r[3]} ms", "ok")
+        self._run_async(work, done)
+
+    def _act_net_flush(self):
+        self._log("Vaciando caché DNS...", "info")
+        self._run_async(NetworkManager.flush_dns,
+            lambda ok: self._log("Caché DNS vaciada." if ok else "Error.", "ok" if ok else "err"))
+
+    def _act_net_dns(self):
+        adapter = simpledialog.askstring(
+            "Cambiar DNS", "Nombre del adaptador (ej. Wi-Fi, Ethernet):",
+            initialvalue="Wi-Fi", parent=self)
+        if not adapter:
+            return
+        self._log(f"Configurando DNS en '{adapter}'...", "info")
+        self._run_async(
+            lambda: NetworkManager.set_fast_dns(adapter),
+            lambda r: self._log(str(r[1]), "ok" if r[0] else "warn"))
+
+    def _act_net_speed(self):
+        self._log("Midiendo velocidad de red...", "info")
+        def work():
+            return NetworkManager.speedtest()
+        def done(r):
+            if r.get("success"):
+                self._log(
+                    f"Descarga: {r['download']} Mbps · Subida: {r['upload']} Mbps · "
+                    f"Ping: {r['ping']} ms", "ok")
+            else:
+                self._log(f"Error: {r.get('error')}", "err")
+        self._run_async(work, done)
+
+    # =====================================================
+    # PAGE: AI HUB
+    # =====================================================
+    def _page_ai(self):
+        frame = ctk.CTkScrollableFrame(self.page_container, corner_radius=0)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        self._page_header(
+            frame, "AI Hub · Gemini",
+            "Diagnóstico inteligente del equipo mediante LLM.",
+            "Configura tu API Key de Google Gemini (gratis en "
+            "https://aistudio.google.com/app/apikey) y obtén un análisis "
+            "profesional de las métricas de tu PC.")
+
+        status = "✓ Configurada" if self._ai_key else "⚠ Sin configurar"
+        self._action_card(frame, f"Estado: {status}",
+            "Vincular API Key de Gemini (autodetección de modelo disponible).",
+            self._act_ai_key, "🔑")
+        self._action_card(frame, "Solicitar Diagnóstico IA",
+            "Envía métricas del sistema a Gemini y recibe recomendaciones.",
+            self._act_ai_diag, "✨")
+
+    def _act_ai_key(self):
+        key = simpledialog.askstring(
+            "API Key Gemini", "Pega tu API Key:", show="*", parent=self)
+        if not key:
+            return
+        self._log("Validando credenciales con Google...", "info")
+        self._run_async(
+            lambda: AIHub.test_gemini_key(key),
+            lambda r: self._on_ai_key_validated(key, r))
+
+    def _on_ai_key_validated(self, key, result):
+        ok, info = result
+        if ok:
+            self._ai_key = key
+            self._ai_model = info
+            self._log(f"API Key válida. Modelo seleccionado: {info}", "ok")
+            self._show_page("ai")
+        else:
+            self._log(f"API Key rechazada: {info}", "err")
+
+    def _act_ai_diag(self):
+        if not self._ai_key:
+            self._log("Primero configura la API Key.", "warn")
+            return
+        self._log("Generando diagnóstico con Gemini...", "info")
+        info = SystemInfo.get_info()
+        summary = (
+            f"OS: {info['os']}, CPU: {info['cpu_usage']}%, "
+            f"RAM: {info['ram_usage']}% ({info['ram_free_gb']} GB libres de {info['ram_total_gb']} GB), "
+            f"Disco: {info['disk_usage']}%")
+        self._run_async(
+            lambda: AIHub.diagnose(self._ai_key, self._ai_model, summary),
+            lambda r: self._log(r, "ok"))
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    app = AvizorApp()
+    app.mainloop()
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        console.print("\n[bold cyan]Cerrando AvizorCleaner.[/bold cyan]")
         sys.exit(0)
-    except Exception as e:
-        console.print(f"\n[red]Error inesperado:[/red] {e}")
-        try:
-            Prompt.ask("\nPresione Enter para salir")
-        except Exception:
-            time.sleep(2)
-        sys.exit(1)
-
